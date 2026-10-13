@@ -23,7 +23,7 @@ import numpy as np
 import torch
 from matplotlib.colors import TwoSlopeNorm
 
-from attention import layer_kind, spike_scores
+from attention import layer_kind, short, spike_scores
 
 
 def token_labels(tokenizer, prompt):
@@ -65,14 +65,6 @@ def save(fig, path):
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
-
-
-def short(name):
-    """down_blocks.1.attentions.0.transformer_blocks.0.attn2 -> down1.attentions0.attn2"""
-    for old, new in [(".transformer_blocks.0", ""), ("_blocks.", ""), ("_block", ""),
-                     ("attentions.", "attentions"), ("motion_modules.", "motion")]:
-        name = name.replace(old, new)
-    return name
 
 
 def plot_cross(title, attn, z, tau, labels, path):
@@ -227,5 +219,24 @@ def write_guard_summary(spikes, labels, path):
     if spikes:
         lines.append("\nAll attenuated layers together:")
         lines += [f"  {labels[i]:24s} {all_counts[i]}/{all_rows}" for i in range(len(labels)) if all_counts[i] > 0]
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def write_soften_summary(stats, layers, temperature, keep_sot, path):
+    """stats: layer -> list over steps of {"entropy"/"top"/"sot": (before, after)}, each a mean over
+    (frames or pixel locations, heads, queries). Values are averaged over the steps here."""
+    lines = [f"Softened layers (temperature T = {temperature}{', <sot> kept' if keep_sot else ''}), stream 1 only.",
+             "Mean over steps, frames/locations, heads and queries, before -> after softening:",
+             "  entropy = entropy of the attention distribution (nats)",
+             "  top     = largest attention probability of a key (cross: <sot> excluded)",
+             "  sot     = attention on <sot> (cross only)\n"]
+    for name in layers:
+        if name not in stats:
+            lines.append(f"{short(name):28s} (spatial: fused kernel, no statistics)")
+            continue
+        mean = {key: np.mean([s[key] for s in stats[name]], axis=0) for key in stats[name][0]}
+        cols = [f"{key} {b:.3f} -> {a:.3f}" for key, (b, a) in mean.items() if not np.isnan(b)]
+        lines.append(f"{short(name):28s} " + "   ".join(cols))
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")

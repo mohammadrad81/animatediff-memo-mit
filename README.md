@@ -4,12 +4,16 @@ This project applies **CA-in-GUARD** to the text-to-video model AnimateDiff. CA-
 memorization-mitigation method from *"You Don't Need All That Attention: Surgical Memorization
 Mitigation in Text-to-Image Diffusion Models"* (Zhao et al., ICML 2026,
 [code](https://github.com/kairanzhao/GUARD)). The project also plots every attention map of the
-model and marks the "spiky" ones.
+model and marks the "spiky" ones. A third experiment, `soften`, tests a simpler alternative to GUARD:
+instead of detecting spiky tokens and attenuating only those, it softens all the attention of chosen
+layers with a temperature.
 
 - Model: `CompVis/stable-diffusion-v1-4` + motion adapter `guoyww/animatediff-motion-adapter-v1-4`
-- Two commands:
+- Four commands:
   - `attention` generates a video, then plots spatial, cross- and temporal attention for every layer, head, frame and diffusion step, with spikes marked.
   - `generate` generates a video with GUARD (and, optionally, the normal video for comparison).
+  - `soften` generates a video with temperature-softened attention in the layers you choose (and, optionally, the normal video).
+  - `batch` runs any of these experiments (normal, GUARD, soften) on every prompt of a CSV sheet and saves the GIFs.
 
 ## The method in short
 
@@ -162,7 +166,7 @@ an *absolute* probability on one color scale for the whole panel.
 
 #### Speed
 
-Plotting is the slow part: 72 figures per step, saved at `dpi=300` (set in `save()` in `plots.py`;
+Plotting is the slow part: 72 figures per step, saved at `dpi=200` (set in `save()` in `plots.py`;
 lower it for faster, smaller images). That is about a minute per step, so use `--plot-steps` to look at
 a few steps first.
 
@@ -187,20 +191,193 @@ Output in `outputs/guard/`:
 | `--r` | 2.0 | repulsion scale (0 = CA attenuation only) |
 | `--r-schedule` | `cosine` | `cosine`: `r` decays to 0 (official code); `constant`: paper Eq. 5 |
 | `--alpha` | 0.3 | spiky logits are multiplied by this (1 = no attenuation) |
-| `--tau` | 0.1 | spike threshold on the z-score |
+| `--tau` | 3.0 | spike threshold on the z-score |
 | `--blocks` | `down,mid` | UNet parts whose cross-attention is attenuated (`down`, `mid`, `up`) |
 | `--baseline` | off | also make the normal video |
 
 The defaults are the official repo's CA-in-GUARD settings for SD v1.4. The paper's search ranges
 (their Table 2) were `tau` 0.1–3, `alpha` 0.1–0.9 and `r` 0.1–6.
 
+### 3. Soften attention with a temperature
+
+GUARD finds the spiky tokens and scales only their logits by `alpha`. This experiment asks whether that
+targeting is needed: in the chosen layers, **all** logits are divided by a temperature `T` before the
+softmax, with no spike detection at all:
+
+```
+attention = softmax( Q K^T / (sqrt(d) * T) )        T > 1: softer (flatter), T = 1: no change, T < 1: sharper
+```
+
+A spike is a key whose logit is far above the others. Dividing all logits by `T` shrinks every gap by the
+same factor, so spikes lose their dominance, but so does every other strong attention in the layer.
+As in GUARD, only the prompt stream (stream 1) is changed. The unconditional stream keeps normal attention.
+
+```bash
+# cross-attention of the down and mid blocks (the layers GUARD attenuates), T = 2, with the normal video for comparison
+python main.py soften --prompt "Living in the Light with Ann Graham Lotz" -T 2 --baseline
+
+# only text tokens 1..76 are flattened; <sot> keeps its normal share of the attention
+python main.py soften --prompt "..." -T 2 --keep-sot --baseline
+
+# particular layers: two transformer blocks, cross and spatial attention
+python main.py soften --prompt "..." -T 1.5 --kinds cross,spatial --layers down1.attentions0,mid --baseline
+
+# temporal attention (motion modules) of the up blocks
+python main.py soften --prompt "..." -T 2 --kinds temporal --layers up --baseline
+
+# with GUARD's repulsion from the normal prediction (3 streams: uncond, softened, normal)
+python main.py soften --prompt "..." -T 2 --r 2 --baseline
+```
+
+| option | default | meaning |
+|---|---|---|
+| `--temperature`, `-T` | 2.0 | logits are divided by `T` before the softmax |
+| `--kinds` | `cross` | kinds of attention layers to soften: `cross`, `spatial`, `temporal` (comma separated) |
+| `--layers` | `down,mid` | prefixes of the layer names to soften (see below) |
+| `--keep-sot` | off | cross-attention only: keep the attention on `<sot>` and soften only tokens 1..76 |
+| `--r` | 0 | repulsion from the normal prediction, as in GUARD (0 = plain CFG with the softened stream) |
+| `--r-schedule` | `cosine` | `cosine`: `r` decays to 0; `constant`: fixed `r` |
+| `--baseline` | off | also make the normal video |
+
+**Choosing layers.** A layer is softened if its kind is in `--kinds` and its short name (the names used
+in the `attention` plots) or its full diffusers name starts with one of the `--layers` prefixes. The
+selected layers are printed when the command starts. Examples:
+
+| `--layers` | selects |
+|---|---|
+| `down,mid` | every layer of the down and mid blocks |
+| `up` | every layer of the up blocks |
+| `down1` | the layers of down block 1 |
+| `down1.attentions0` | the first transformer block of down block 1 (`attn1` = spatial, `attn2` = cross) |
+| `up3.motion` | all motion modules (temporal attention) of up block 3 |
+| `down2.attentions1.attn2,mid` | one cross-attention layer, plus the mid block |
+
+The blocks are `down0`–`down3`, `mid` and `up0`–`up3`. `down0`–`down2` and `up1`–`up3` each have 2 (down)
+or 3 (up) transformer blocks (`attentions0..`); `down3` and `up0` have none. Every down and up block
+has motion modules (`motion0..`) and `mid` has `attentions0` only. Run `python main.py attention` once to
+see the full list of names in `spikes.txt`.
+
+**Why `--keep-sot`.** In cross-attention, `<sot>` usually takes most of the attention (often > 90%) and
+acts as a "no-op" sink. Plain temperature flattens the whole distribution, so it moves attention
+*from* `<sot>` *to* the text tokens. That makes the prompt stronger, which is probably the opposite of
+what you want against memorization. With `--keep-sot`, `<sot>` keeps its normal probability `p_0` and
+only the text tokens are flattened:
+
+```
+p_0 unchanged,     p_i = (1 - p_0) * softmax(logits[1:] / T)_i   for i = 1..76
+```
+
+This is the closer analogue of GUARD, which also leaves `<sot>` alone. Comparing both settings is
+part of the experiment.
+
+Output in `outputs/soften/`:
+
+| file | |
+|---|---|
+| `soft.gif` | video generated with softened attention |
+| `baseline.gif` | (with `--baseline`) normal AnimateDiff, same seed |
+| `baseline_vs_soft.gif` | (with `--baseline`) both side by side |
+| `softened_layers.txt` | each softened layer with the mean entropy, the largest key probability (`top`, `<sot>` excluded) and the attention on `<sot>`, before → after softening |
+
+`softened_layers.txt` shows how strongly a given `T` actually changes each layer, e.g.
+
+```
+mid.attentions0.attn2        entropy 1.282 -> 1.564   top 0.075 -> 0.030   sot 0.688 -> 0.688
+down1.motion0.attn1          entropy 1.589 -> 1.890   top 0.399 -> 0.269
+```
+
+Spatial layers are softened with diffusers' fused attention kernel (their maps can be 4096 × 4096), so
+no statistics are computed for them.
+
+**Comparing with GUARD.** Use the same `--prompt`, `--seed` and `--s` for both commands. Default
+`soften` (cross-attention of `down,mid`, `--r 0`) touches the same layers as `python main.py generate
+--r 0`, the paper's "CA attenuation" alone. Add `--r 2` to both to compare with full CA-in-GUARD.
+
+### 4. Run the experiments on a CSV sheet of prompts
+
+The sheet must have a column `caption` (the prompt) and a column `index` (used as the file name). Other
+columns are ignored, and rows with an empty caption are skipped.
+
+```csv
+index,caption
+101,Living in the Light with Ann Graham Lotz
+102,"a cat playing piano, studio light"
+```
+
+```bash
+# all three experiments on the whole sheet
+python main.py batch --csv prompts.csv --out outputs/my_run
+
+# only normal inference and GUARD
+python main.py batch --csv prompts.csv --out outputs/my_run --experiments normal,guard
+
+# softening with other settings: use a new folder
+python main.py batch --csv prompts.csv --out outputs/soft_T3_keepsot --experiments soften -T 3 --keep-sot
+```
+
+The GIFs are saved as `<out>/<experiment>/<index>.gif`:
+
+```
+outputs/my_run/
+    settings.json        all settings of the run
+    normal/101.gif       plain AnimateDiff
+    guard/101.gif        CA-in-GUARD
+    soften/101.gif       softened attention
+```
+
+All experiments use the same seed (`--seed`), so for a given prompt the three videos start from the same
+noise and can be compared directly.
+
+**Splitting the sheet into parts.** `--start` and `--end` select rows of the sheet (0 = the first data
+row, `--end` is not included), so a large sheet can be run in parts, one after the other or at the same
+time on different GPUs, all into the same `--out` folder:
+
+```bash
+python main.py batch --csv prompts.csv --out outputs/my_run --start 0   --end 500
+python main.py batch --csv prompts.csv --out outputs/my_run --start 500 --end 1000
+CUDA_VISIBLE_DEVICES=1 python main.py batch --csv prompts.csv --out outputs/my_run --start 1000
+```
+
+**Stopping and continuing.** A GIF that already exists is not generated again. If a run stops (crash,
+Ctrl+C, time limit), run the same command again and it continues where it stopped. To regenerate a
+video, delete its GIF. You can also add an experiment later (run again with another `--experiments`).
+
+**Settings are fixed per folder.** The first run writes `settings.json`. A later run into the same
+folder with different generation settings (e.g. another `--alpha` or `-T`) stops with an error, so
+videos made with different settings are never mixed. Use a new `--out` for each setting. `--start`,
+`--end`, `--batch-size`, `--experiments` and the `--csv` / `--out` paths may change between runs.
+
+| option | default | meaning |
+|---|---|---|
+| `--csv` | (required) | the sheet, with columns `index` and `caption` |
+| `--out` | `outputs/batch` | output folder |
+| `--experiments` | `normal,guard,soften` | which experiments to run |
+| `--start`, `--end` | whole sheet | rows to run |
+| `--batch-size` | 1 | prompts generated together in one UNet pass (see below) |
+| `--guard-r`, `--alpha`, `--tau`, `--blocks` | 2.0, 0.3, 0.1, `down,mid` | GUARD settings, as in `generate` (`--guard-r` is `generate`'s `--r`) |
+| `-T`, `--kinds`, `--layers`, `--keep-sot`, `--soften-r` | 2.0, `cross`, `down,mid`, off, 0 | soften settings, as in `soften` (`--soften-r` is `soften`'s `--r`) |
+| `--r-schedule` | `cosine` | schedule of both `--guard-r` and `--soften-r` |
+
+`--frames`, `--steps`, `--height`, `--width`, `--seed`, `--s` and `--fps` are the same as in the other commands.
+
+**`--batch-size`** generates several prompts in one UNet pass. On the RTX 5060 Ti at 512×512 with 16
+frames this is **not faster**: one video already keeps the GPU busy, and a batch of 2 takes exactly twice
+as long (normal: 33 s alone, 67 s for 2; GUARD: 49 s alone, 98 s for 2) and needs more memory (normal
+5.7 → 7.7 GB, GUARD 6.7 → 9.7 GB). It can help on a larger GPU or at a smaller size. A video made in a
+batch is *almost* the same as one made alone. The computation is the same, but fp16 rounding differs
+with the batch size and the denoising loop amplifies it (mean pixel difference ≈ 5/255; adding noise of
+1e-3 to the noise prediction gives ≈ 3/255). Keep the same `--batch-size` across the runs you compare.
+
+Run time is about 33 s per video for normal and 49 s for GUARD (or soften with `--soften-r`), so the
+three experiments together take about 2 minutes per prompt at the default settings.
+
 ## Code
 
 | file | content |
 |---|---|
-| `main.py` | command line (`attention`, `generate`) |
-| `sampler.py` | loads AnimateDiff and runs the denoising loop: normal CFG (2 streams) or GUARD (3 streams) |
-| `attention.py` | the attention processor put in every layer: `spike_scores` / `find_spikes` (detector), `Processor.attenuated` (GUARD), `Processor.recorded` (stores maps for plots) |
+| `main.py` | command line (`attention`, `generate`, `soften`, `batch`); `experiment()` builds the normal / guard / soften setup that all commands share |
+| `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams) |
+| `attention.py` | the attention processor put in every layer: `spike_scores` / `find_spikes` (detector), `Processor.attenuated` (GUARD), `Processor.softened` (temperature), `Processor.recorded` (stores maps for plots), `select_layers` (layer choice for `soften`) |
 | `plots.py` | all figures and the text summaries |
 
 ## Notes

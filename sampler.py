@@ -24,6 +24,8 @@ def load_pipeline(device="cuda", dtype=torch.float16):
 def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=0,
            s=7.5, r=0.0, r_schedule="cosine"):
     """Generate a video and return it as a list of PIL images.
+    prompt can also be a list of prompts, generated together in one batch; a list of videos is returned then.
+    Every video starts from the same noise (from seed), so it is the same video as when generated alone.
 
     ctrl.num_streams == 2 -> classifier-free guidance:
         eps = eps_null + s * (eps_cond - eps_null)
@@ -38,16 +40,19 @@ def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=
     def embed(text):
         ids = pipe.tokenizer(text, padding="max_length", max_length=pipe.tokenizer.model_max_length,
                              truncation=True, return_tensors="pt").input_ids
-        return pipe.text_encoder(ids.to(device))[0]  # [1, 77, 768]
+        return pipe.text_encoder(ids.to(device))[0]  # [texts, 77, 768]
 
-    e_null, e_prompt = embed(""), embed(prompt)
+    prompts = [prompt] if isinstance(prompt, str) else list(prompt)
+    e_prompt = embed(prompts)                          # [videos, 77, 768]
+    e_null = embed("").expand_as(e_prompt)
     # Positive and negative streams use the same prompt; only the attention inside the UNet differs.
+    # Rows are ordered stream, video, frame, so each stream is still one contiguous block for the processors.
     streams = [e_null, e_prompt, e_prompt] if ctrl.num_streams == 3 else [e_null, e_prompt]
-    text = torch.cat(streams).repeat_interleave(frames, dim=0)  # one copy per frame: [streams * frames, 77, 768]
+    text = torch.cat(streams).repeat_interleave(frames, dim=0)  # one copy per frame: [streams * videos * frames, 77, 768]
 
     pipe.scheduler.set_timesteps(steps, device=device)
-    generator = torch.Generator(device).manual_seed(seed)
-    latents = torch.randn((1, 4, frames, height // 8, width // 8), generator=generator, device=device, dtype=dtype)
+    latents = torch.cat([torch.randn((1, 4, frames, height // 8, width // 8), generator=torch.Generator(device).manual_seed(seed),
+                                     device=device, dtype=dtype) for _ in prompts])
     latents = latents * pipe.scheduler.init_noise_sigma
 
     for i, t in enumerate(tqdm(pipe.scheduler.timesteps, desc="denoising")):
@@ -63,8 +68,9 @@ def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=
         latents = pipe.scheduler.step(noise, t, latents).prev_sample
 
     torch.cuda.empty_cache()
-    video = pipe.decode_latents(latents, decode_chunk_size=4)  # [1, 3, frames, H, W]; 4 frames at a time saves memory
-    return pipe.video_processor.postprocess_video(video, output_type="pil")[0]
+    video = pipe.decode_latents(latents, decode_chunk_size=4)  # [videos, 3, frames, H, W]; 4 frames at a time saves memory
+    videos = pipe.video_processor.postprocess_video(video, output_type="pil")
+    return videos[0] if isinstance(prompt, str) else videos
 
 
 def save_gif(frames, path, fps=8):

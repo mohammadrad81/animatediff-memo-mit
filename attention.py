@@ -1,13 +1,14 @@
 """Custom attention processor for the AnimateDiff UNet.
 
 It replaces diffusers' attention in every layer and can
-  1. record attention maps of the prompt-conditioned stream (for plotting), and
-  2. apply GUARD's cross-attention attenuation to the "positive" stream.
+  1. record attention maps of the prompt-conditioned stream (for plotting),
+  2. apply GUARD's cross-attention attenuation to the "positive" stream, or
+  3. soften the attention of chosen layers of that stream with a temperature (the `soften` experiment).
 
 The UNet batch is made of "streams", each with one row per frame:
   2 streams: [uncond, cond]                 (normal classifier-free guidance)
   3 streams: [uncond, positive, negative]   (GUARD)
-Stream 1 (rows n:2n) is the one we record / attenuate.
+Stream 1 (rows n:2n) is the one we record / attenuate / soften.
 
 Inside the UNet there are three kinds of attention layers:
   spatial  (attentions.*.attn1):      pixels of a frame  -> pixels of the same frame
@@ -23,6 +24,14 @@ def layer_kind(name):
     if "motion_modules" in name:
         return "temporal"
     return "cross" if name.endswith("attn2") else "spatial"
+
+
+def short(name):
+    """down_blocks.1.attentions.0.transformer_blocks.0.attn2 -> down1.attentions0.attn2"""
+    for old, new in [(".transformer_blocks.0", ""), ("_blocks.", ""), ("_block", ""),
+                     ("attentions.", "attentions"), ("motion_modules.", "motion")]:
+        name = name.replace(old, new)
+    return name
 
 
 def spike_scores(peak, skip_first=False):
@@ -49,13 +58,18 @@ def find_spikes(peak, tau, skip_first=False):
 class Controller:
     """State shared by all attention processors."""
 
-    def __init__(self, num_streams, record=False, guard_layers=(), tau=0.1, alpha=0.3):
-        self.num_streams = num_streams          # 2 = CFG, 3 = GUARD
+    def __init__(self, num_streams, record=False, guard_layers=(), tau=3.0, alpha=0.3,
+                 soft_layers=(), temperature=1.0, keep_sot=False):
+        self.num_streams = num_streams          # 2 = CFG, 3 = GUARD (or soften with repulsion)
         self.record = record                    # store attention maps of stream 1
         self.guard_layers = set(guard_layers)   # cross-attn layers where GUARD attenuates spikes
         self.tau, self.alpha = tau, alpha       # spike threshold and logit scaling factor
+        self.soft_layers = set(soft_layers)     # layers (any kind) whose attention is softened
+        self.temperature = temperature          # logits are divided by it (> 1 = softer, < 1 = sharper)
+        self.keep_sot = keep_sot                # cross-attn: keep the mass on <sot>, soften tokens 1..76 only
         self.maps = {}     # layer -> list over steps of (attn, peak)  (filled when record=True)
         self.spikes = {}   # layer -> list over steps of ([77] count of attenuated (frame, head) rows, number of rows)
+        self.soft_stats = {}  # layer -> list over steps of {"entropy"/"top"/"sot": (before, after)}
 
 
 class Processor:
@@ -75,6 +89,8 @@ class Processor:
         s1 = slice(n, 2 * n)
         if self.name in self.ctrl.guard_layers:
             out[s1] = self.attenuated(attn, q[s1], k[s1], v[s1])
+        elif self.name in self.ctrl.soft_layers:
+            out[s1] = self.softened(attn, q[s1], k[s1], v[s1])
         elif self.ctrl.record:
             out[s1] = self.recorded(attn, q[s1], k[s1], v[s1])
 
@@ -89,6 +105,32 @@ class Processor:
         logits = torch.where(spikes[:, :, None, :], logits * self.ctrl.alpha, logits)
         self.ctrl.spikes.setdefault(self.name, []).append((spikes.sum((0, 1)).cpu(), spikes.shape[0] * spikes.shape[1]))
         return (logits.softmax(-1) @ v.float()).to(v.dtype)
+
+    def softened(self, attn, q, k, v):
+        """Temperature-softened attention: softmax(Q K^T / (sqrt(d) * T)), for every key (no spike detection).
+
+        With keep_sot (cross-attention only), <sot> keeps its normal probability p_0 and only the text tokens
+        are softened: p_i = (1 - p_0) * softmax(logits[1:] / T)_i. Plain temperature would otherwise move
+        attention from <sot> (which takes most of it) to the text tokens, i.e. strengthen the prompt.
+        Statistics of the attention before/after are stored for cross and temporal layers. Spatial maps can be
+        4096 x 4096, so there the fused kernel is used and nothing is stored."""
+        T = self.ctrl.temperature
+        if self.kind == "spatial":
+            return F.scaled_dot_product_attention(q, k, v, scale=attn.scale / T)
+        logits = (q.float() @ k.float().transpose(-1, -2)) * attn.scale  # [rows, heads, queries, keys]
+        before = logits.softmax(-1)
+        if self.kind == "cross" and self.ctrl.keep_sot:
+            sot = before[..., :1]
+            after = torch.cat([sot, (1 - sot) * (logits[..., 1:] / T).softmax(-1)], -1)
+        else:
+            after = (logits / T).softmax(-1)
+        first = 1 if self.kind == "cross" else 0  # "top" ignores <sot>, which always takes most of the attention
+        stats = {key: tuple(fn(p).mean().item() for p in (before, after)) for key, fn in [
+            ("entropy", lambda p: torch.special.entr(p).sum(-1)),  # in nats
+            ("top", lambda p: p[..., first:].amax(-1)),
+            ("sot", lambda p: p[..., 0] if first else torch.full_like(p[..., 0], float("nan")))]}
+        self.ctrl.soft_stats.setdefault(self.name, []).append(stats)
+        return (after @ v.float()).to(v.dtype)
 
     def recorded(self, attn, q, k, v):
         """Plain attention, computed a few rows at a time (spatial maps can be 4096 x 4096), while storing:
@@ -124,3 +166,10 @@ def cross_layers(unet, blocks):
     """Names of the cross-attention layers in the given UNet parts, e.g. blocks=["down", "mid"]."""
     names = [key.removesuffix(".processor") for key in unet.attn_processors]
     return [n for n in names if layer_kind(n) == "cross" and n.split("_")[0] in blocks]
+
+
+def select_layers(unet, kinds, prefixes):
+    """Names of the attention layers of the given kinds (cross/spatial/temporal) whose short or full name starts
+    with one of the prefixes, e.g. kinds=["cross"], prefixes=["down", "mid"] or ["down1.attentions0", "up3.motion"]."""
+    names = [key.removesuffix(".processor") for key in unet.attn_processors]
+    return [n for n in names if layer_kind(n) in kinds and any(short(n).startswith(p) or n.startswith(p) for p in prefixes)]
