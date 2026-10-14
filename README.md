@@ -109,7 +109,7 @@ This generates the video with normal AnimateDiff and records the attention of th
 
 | option | default | meaning |
 |---|---|---|
-| `--tau` | 3.0 | spike threshold on the z-score (3 marks strong outliers only; use 0.1 to see what `generate` attenuates) |
+| `--tau` | 3.0 | spike threshold on the z-score (3 marks strong outliers only; use 0.1 to see what `guard` attenuates) |
 | `--plot-steps` | all | diffusion steps to plot, e.g. `0,12,24` (0 = first, noisiest step) |
 
 Output in `outputs/attention/`:
@@ -173,7 +173,7 @@ a few steps first.
 ### 2. Generate a video with GUARD
 
 ```bash
-python main.py generate --prompt "Living in the Light with Ann Graham Lotz" --baseline
+python main.py guard --prompt "Living in the Light with Ann Graham Lotz" --baseline
 ```
 
 Output in `outputs/guard/`:
@@ -290,7 +290,7 @@ Spatial layers are softened with diffusers' fused attention kernel (their maps c
 no statistics are computed for them.
 
 **Comparing with GUARD.** Use the same `--prompt`, `--seed` and `--s` for both commands. Default
-`soften` (cross-attention of `down,mid`, `--r 0`) touches the same layers as `python main.py generate
+`soften` (cross-attention of `down,mid`, `--r 0`) touches the same layers as `python main.py guard
 --r 0`, the paper's "CA attenuation" alone. Add `--r 2` to both to compare with full CA-in-GUARD.
 
 ### 4. Run the experiments on a CSV sheet of prompts
@@ -354,7 +354,7 @@ videos made with different settings are never mixed. Use a new `--out` for each 
 | `--experiments` | `normal,guard,soften` | which experiments to run |
 | `--start`, `--end` | whole sheet | rows to run |
 | `--batch-size` | 1 | prompts generated together in one UNet pass (see below) |
-| `--guard-r`, `--alpha`, `--tau`, `--blocks` | 2.0, 0.3, 0.1, `down,mid` | GUARD settings, as in `generate` (`--guard-r` is `generate`'s `--r`) |
+| `--guard-r`, `--alpha`, `--tau`, `--blocks` | 2.0, 0.3, 0.1, `down,mid` | GUARD settings, as in `guard` (`--guard-r` is `guard`'s `--r`) |
 | `-T`, `--kinds`, `--layers`, `--keep-sot`, `--soften-r` | 2.0, `cross`, `down,mid`, off, 0 | soften settings, as in `soften` (`--soften-r` is `soften`'s `--r`) |
 | `--r-schedule` | `cosine` | schedule of both `--guard-r` and `--soften-r` |
 
@@ -375,7 +375,7 @@ three experiments together take about 2 minutes per prompt at the default settin
 
 | file | content |
 |---|---|
-| `main.py` | command line (`attention`, `generate`, `soften`, `batch`); `experiment()` builds the normal / guard / soften setup that all commands share |
+| `main.py` | command line (`attention`, `guard`, `soften`, `batch`); `experiment()` builds the normal / guard / soften setup that all commands share |
 | `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams) |
 | `attention.py` | the attention processor put in every layer: `spike_scores` / `find_spikes` (detector), `Processor.attenuated` (GUARD), `Processor.softened` (temperature), `Processor.recorded` (stores maps for plots), `select_layers` (layer choice for `soften`) |
 | `plots.py` | all figures and the text summaries |
@@ -383,13 +383,13 @@ three experiments together take about 2 minutes per prompt at the default settin
 ## Notes
 
 - Memory and speed (512×512, 16 frames, 25 steps, 16 GB GPU): normal sampling takes about
-  1.25 s/step, GUARD about 1.9 s/step (3 streams). `generate` peaks at about 9 GB of GPU memory.
+  1.25 s/step, GUARD about 1.9 s/step (3 streams). `guard` peaks at about 9 GB of GPU memory.
   `attention` needs more because of the explicit spatial attention maps. If you run out of memory, lower
   `--height/--width` (e.g. 384) or `--frames`. AnimateDiff v1 was trained at 256×256.
 - With only 16 frames, a z-score cannot exceed `15/sqrt(16) = 3.75`. With `tau = 3`, spiky key frames
   in temporal attention are therefore rare; try `--tau 1` or `2` for those plots.
 - The `attention` command computes the spatial self-attention explicitly (4096 × 4096 per head and
-  frame at 512×512), so it is slower than `generate`. In RAM it keeps about 0.4 GB of maps per 25 steps.
+  frame at 512×512), so it is slower than `guard`. In RAM it keeps about 0.4 GB of maps per 25 steps.
 - `attention` uses plain softmax attention in fp16, which differs from diffusers' fused kernel only by
   rounding (max difference ≈ 0.008 in the noise prediction). Without recording or attenuation, the
   processor is identical to diffusers' and the sampler reproduces `AnimateDiffPipeline` frame-for-frame.

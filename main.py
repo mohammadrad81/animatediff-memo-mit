@@ -1,4 +1,4 @@
-"""Command line interface. See README.md, or run:  python main.py {attention,generate,soften,batch} --help"""
+"""Command line interface. See README.md, or run:  python main.py {attention,guard,soften,batch} --help"""
 import argparse
 import csv
 import json
@@ -79,7 +79,7 @@ def run_attention(args, pipe):
     plot_all(ctrl.maps, labels, eot, args.tau, (args.height // 8, args.width // 8), args.out, steps)
 
 
-def run_generate(args, pipe):
+def run_guard(args, pipe):
     """CA-in-GUARD generation (and optionally the plain CFG video with the same seed for comparison)."""
     common = (args.frames, args.steps, args.height, args.width, args.seed, args.s)
     if args.baseline:
@@ -191,7 +191,7 @@ def main():
     a.add_argument("--tau", type=float, default=3.0, help="spike threshold on the z-score")
     a.add_argument("--plot-steps", default=None, help="diffusion steps to plot, e.g. 0,12,24 (default: all)")
 
-    g = sub.add_parser("generate", help="generate a video with CA-in-GUARD")
+    g = sub.add_parser("guard", help="generate a video with CA-in-GUARD")
     video_args(g, "outputs/guard")
     guard_args(g)
     schedule_arg(g)
@@ -219,8 +219,8 @@ def main():
     pipe = load_pipeline()
     if args.command == "attention":
         run_attention(args, pipe)
-    elif args.command == "generate":
-        run_generate(args, pipe)
+    elif args.command == "guard":
+        run_guard(args, pipe)
     elif args.command == "soften":
         run_soften(args, pipe)
     else:
