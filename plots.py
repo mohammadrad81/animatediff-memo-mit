@@ -62,8 +62,9 @@ def decorate(ax, im, ylabel, xlabels, ylabels, title):
 
 
 def save(fig, path):
-    fig.tight_layout()
-    fig.savefig(path, dpi=200)
+    if fig.get_layout_engine() is None:  # figures made with layout="constrained" arrange themselves
+        fig.tight_layout()
+    fig.savefig(path, dpi=300)
     plt.close(fig)
 
 
@@ -75,6 +76,32 @@ def plot_cross(title, attn, z, tau, labels, path):
         heatmap(row[0], attn.max(dim)[:, 1:], ylabel, labels[1:], title=f"attention probability, max over {other}")
         zmap(row[1], z.max(dim)[:, 1:], tau, ylabel, labels[1:], title=f"spike score Z, max over {other} (x: Z > {tau})")
     fig.suptitle(title)
+    save(fig, path)
+
+
+def plot_cross_steps(title, attn, labels, steps, path):
+    """attn: [steps, heads, 77] (one frame, or max over frames). One panel per head: for every token (x axis),
+    its max attention over the query pixels (y axis), one line per diffusion step (colour = step).
+    Token 0 (<sot>) is left out: it always dominates."""
+    a = attn[:, :, 1:]  # [steps, heads, 76]
+    heads, x = a.shape[1], np.arange(a.shape[2])
+    cmap, norm = plt.get_cmap("viridis"), plt.Normalize(min(steps), max(steps))
+    rows = (heads + 1) // 2
+    fig, axes = plt.subplots(rows, 2, figsize=(26, 3.8 * rows), squeeze=False, layout="constrained")
+    for hd, ax in enumerate(axes.flat):
+        if hd >= heads:
+            ax.axis("off")
+            continue
+        for t in steps:
+            ax.plot(x, a[t, hd], color=cmap(norm(t)), lw=0.5, marker="o", ms=1)
+        ax.set_title(f"head {hd}", fontsize=9)
+        ax.set_ylabel("max attention probability")
+        ax.set_xticks(x, labels[1:], rotation=90, fontsize=6)
+        ax.set_xlim(-0.5, len(x) - 0.5)
+        ax.grid(alpha=0.3)
+    fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=axes, fraction=0.02, pad=0.01,
+                 label="diffusion step (0 = first, noisiest)")
+    fig.suptitle(f"{title}: max cross-attention per token, one line per step")
     save(fig, path)
 
 
@@ -119,14 +146,16 @@ def plot_temporal(title, attn, z, tau, path):
 
 
 def plot_all(maps, labels, eot, tau, latent_hw, out_dir, steps=None):
-    """Make the figures of every diffusion step (or only `steps`) in out_dir/step_XX/, plus spikes.txt
-    and cross_summary.png in out_dir."""
+    """Make the figures of every diffusion step (or only `steps`) in out_dir/step_XX/, the token-by-step line
+    charts in out_dir/cross_steps/ (max over frames) and out_dir/cross_steps_frames/<layer>/ (one per frame),
+    plus spikes.txt and cross_summary.png in out_dir."""
     num_steps = len(next(iter(maps.values())))
     steps = range(num_steps) if steps is None else [t for t in steps if 0 <= t < num_steps]
     step_dir = {t: os.path.join(out_dir, f"step_{t:02d}") for t in steps}
     for d in step_dir.values():
         for kind in ["cross", "spatial", "temporal"]:
             os.makedirs(os.path.join(d, kind), exist_ok=True)
+    os.makedirs(os.path.join(out_dir, "cross_steps"), exist_ok=True)
     # per step and kind: layer names, attention rows, Z rows (for the all-layers overview)
     overview = {t: {"cross": ([], [], []), "temporal": ([], [], [])} for t in steps}
     lines = [f"Spike: Z > tau={tau} in at least one (step, frame, head) row; (n/N) = spike in n of the N rows\n"]
@@ -137,6 +166,14 @@ def plot_all(maps, labels, eot, tau, latent_hw, out_dir, steps=None):
         peak = torch.stack([p for _, p in record])
         z = spike_scores(peak, skip_first=(kind == "cross")).numpy()
         print(f"plotting {short(name)} for {len(steps)} steps")
+        if kind == "cross":  # all steps in one figure: how each token's attention changes over the steps
+            plot_cross_steps(f"{name} (max over frames and query pixels)", attn.max(1), labels, steps,
+                             os.path.join(out_dir, "cross_steps", short(name) + ".png"))
+            frame_dir = os.path.join(out_dir, "cross_steps_frames", short(name))
+            os.makedirs(frame_dir, exist_ok=True)
+            for f in range(attn.shape[1]):  # the same chart for every frame
+                plot_cross_steps(f"{name}, frame {f} (max over query pixels)", attn[:, f], labels, steps,
+                                 os.path.join(frame_dir, f"frame_{f:02d}.png"))
 
         for t in steps:
             title = f"{name}, step {t}"

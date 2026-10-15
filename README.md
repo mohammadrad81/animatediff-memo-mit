@@ -110,7 +110,7 @@ This generates the video with normal AnimateDiff and records the attention of th
 | option | default | meaning |
 |---|---|---|
 | `--tau` | 3.0 | spike threshold on the z-score (3 marks strong outliers only; use 0.1 to see what `guard` attenuates) |
-| `--plot-steps` | all | diffusion steps to plot, e.g. `0,12,24` (0 = first, noisiest step) |
+| `--plot-steps` | all | diffusion steps to plot, e.g. `0,12,24` (0 = first, noisiest step); also the lines drawn in `cross_steps/` |
 
 Output in `outputs/attention/`:
 
@@ -120,6 +120,9 @@ cross_summary.png            like Fig. 1 of the paper: attention per token in th
                              and the attention on <eot> over the steps
 spikes.txt                   every layer's spiky tokens / key frames / pixel locations, with in how many
                              (step, frame, head) rows each is a spike, as n/N
+cross_steps/<layer>.png      per cross-attention layer: how each token's max attention changes over the steps
+                             (max over frames)
+cross_steps_frames/<layer>/frame_XX.png   the same chart for every single frame
 step_00/ ... step_24/        one folder per diffusion step (steps are never combined):
     cross_overview.png       all cross-attention layers in one figure
     temporal_overview.png    all temporal layers in one figure
@@ -148,6 +151,13 @@ an *absolute* probability on one color scale for the whole panel.
 
 #### How to read each figure
 
+- **`cross_steps/<layer>.png`**: a line chart for every head (one panel each).
+  - x axis: tokens 1..76. y axis: the max attention probability the token gets from any frame and query pixel.
+  - One line per diffusion step, colored from dark purple (step 0, noisiest) to yellow (last step); the
+    colorbar shows the mapping. With `--plot-steps`, only those steps are drawn.
+  - Use it to see which tokens gain or lose attention as denoising goes on.
+  - `cross_steps_frames/<layer>/frame_XX.png` is the same chart for one frame (max over that frame's
+    query pixels only), to see whether frames differ. That is one file per layer and frame (16 × 16 = 256).
 - **`cross/<layer>.png`**: two rows of panels, with attention on the left and Z on the right.
   - Top: **heads × tokens**, max over frames.
   - Bottom: **frames × tokens**, max over heads.
