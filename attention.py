@@ -70,6 +70,10 @@ class Controller:
         self.maps = {}     # layer -> list over steps of (attn, peak)  (filled when record=True)
         self.spikes = {}   # layer -> list over steps of ([77] count of attenuated (frame, head) rows, number of rows)
         self.soft_stats = {}  # layer -> list over steps of {"entropy"/"top"/"sot": (before, after)}
+        # memorization signals (filled when record=True):
+        self.eot = None        # index of <eot> in the prompt; set it to record eot_share
+        self.eot_share = {}    # cross layer -> list over steps of [frames, heads] share of attention on <eot> + pads
+        self.guidance = []     # list over steps of [videos, frames] ||eps_cond - eps_null|| (Wen et al.)
 
 
 class Processor:
@@ -138,7 +142,7 @@ class Processor:
         peak = max over queries of the logits (M_i of the spike detector)."""
         rows, heads, nq, nk = q.shape[0], q.shape[1], q.shape[2], k.shape[2]
         chunk = max(1, 2**27 // (heads * nq * nk))
-        outs, attn_max, peak = [], [], []
+        outs, attn_max, peak, eot_share = [], [], [], []
         for i in range(0, rows, chunk):
             logits = (q[i:i + chunk] @ k[i:i + chunk].transpose(-1, -2)) * attn.scale  # [rows, heads, nq, nk]
             probs = logits.softmax(-1)
@@ -149,11 +153,15 @@ class Processor:
             else:                        # rows = frames: max over the query pixels
                 attn_max.append(probs.amax(2))
                 peak.append(logits.amax(2))
+                if self.kind == "cross" and self.ctrl.eot is not None:  # share of attention on <eot> + pads,
+                    eot_share.append(probs[..., self.ctrl.eot:].sum(-1).mean(2, dtype=torch.float32))  # mean over pixels
         if self.kind == "temporal":   # [heads, F, F], [heads, F]
             attn_max, peak = torch.stack(attn_max).amax(0), torch.stack(peak).amax(0)
         else:                         # [F, heads, keys] each
             attn_max, peak = torch.cat(attn_max), torch.cat(peak)
         self.ctrl.maps.setdefault(self.name, []).append((attn_max.half().cpu(), peak.half().cpu()))
+        if eot_share:
+            self.ctrl.eot_share.setdefault(self.name, []).append(torch.cat(eot_share).cpu())  # [frames, heads]
         return torch.cat(outs)
 
 

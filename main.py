@@ -1,4 +1,4 @@
-"""Command line interface. See README.md, or run:  python main.py {attention,guard,soften,batch} --help"""
+"""Command line interface. See README.md, or run:  python main.py {attention,guard,soften,batch,compare} --help"""
 import argparse
 import csv
 import json
@@ -8,7 +8,8 @@ import numpy as np
 from PIL import Image
 
 from attention import Controller, cross_layers, install, select_layers, short
-from plots import plot_all, token_labels, write_guard_summary, write_soften_summary
+from plots import (memorization_signals, plot_all, plot_memorization_signals, token_labels, write_guard_summary,
+                   write_soften_summary)
 from sampler import load_pipeline, sample, save_gif
 
 
@@ -70,13 +71,35 @@ def experiment(name, args, unet, soft_layers=()):
 
 def run_attention(args, pipe):
     """Normal CFG generation while recording the attention maps of the prompt stream, then plot them."""
+    labels, eot = token_labels(pipe.tokenizer, args.prompt)
     ctrl = Controller(num_streams=2, record=True)
+    ctrl.eot = eot  # also record the share of attention on <eot> + padding
     install(pipe.unet, ctrl)
     frames = sample(pipe, args.prompt, ctrl, args.frames, args.steps, args.height, args.width, args.seed, args.s)
     save_gif(frames, os.path.join(args.out, "video.gif"), args.fps)
-    labels, eot = token_labels(pipe.tokenizer, args.prompt)
+
+    # Signals to compare memorized and non-memorized prompts (see also the "compare" command).
+    signals = memorization_signals(ctrl, frames, args.prompt)
+    with open(os.path.join(args.out, "memorization_signals.json"), "w") as f:
+        json.dump(signals, f)
+    plot_memorization_signals([(os.path.basename(os.path.normpath(args.out)), signals)],
+                              os.path.join(args.out, "memorization_signals.png"))
     steps = [int(t) for t in args.plot_steps.split(",")] if args.plot_steps else None  # None = all steps
     plot_all(ctrl.maps, labels, eot, args.tau, (args.height // 8, args.width // 8), args.out, steps)
+
+
+def run_compare(args):
+    """Overlay the memorization signals of several `attention` runs in one figure (no model needed)."""
+    runs = []
+    for d in args.dirs:
+        path = os.path.join(d, "memorization_signals.json")
+        if not os.path.exists(path):
+            raise SystemExit(f"{path} not found: run `python main.py attention ... --out {d}` first")
+        with open(path) as f:
+            runs.append((os.path.basename(os.path.normpath(d)), json.load(f)))
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    plot_memorization_signals(runs, args.out)
+    print(f"written: {args.out}")
 
 
 def run_guard(args, pipe):
@@ -214,7 +237,13 @@ def main():
     soften_args(b, r_flag="--soften-r")
     schedule_arg(b)
 
+    c = sub.add_parser("compare", help="overlay the memorization signals of several attention runs")
+    c.add_argument("dirs", nargs="+", help="output folders of the attention command")
+    c.add_argument("--out", default="outputs/compare.png", help="figure to write")
+
     args = parser.parse_args()
+    if args.command == "compare":  # only reads JSON files: no model is loaded
+        return run_compare(args)
     os.makedirs(args.out, exist_ok=True)
     pipe = load_pipeline()
     if args.command == "attention":

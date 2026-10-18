@@ -277,3 +277,52 @@ def write_soften_summary(stats, layers, temperature, keep_sot, path):
         lines.append(f"{short(name):28s} " + "   ".join(cols))
     with open(path, "w") as f:
         f.write("\n".join(lines) + "\n")
+
+
+def memorization_signals(ctrl, frames, prompt):
+    """The numbers used to compare memorized and non-memorized prompts, as a JSON-friendly dict.
+    guidance:    [steps][frames] ||eps_cond - eps_null|| (Wen et al.: large for memorized prompts)
+    eot_share:   block -> [steps] share of cross-attention on <eot> + padding tokens, mean over the layers of the
+                 block, frames, heads and query pixels (Ren et al. / GUARD Fig. 7: stays high when memorized)
+    frame_change:     [frames-1] mean |pixel difference| between consecutive frames (pixels in 0..1)
+    frame_similarity: [frames] cosine similarity of every frame to frame 0"""
+    eot = {}
+    for name, record in ctrl.eot_share.items():
+        eot.setdefault(name.split("_")[0], []).append(torch.stack(record))  # [steps, frames, heads]
+    video = np.stack([np.asarray(f, dtype=np.float32) / 255 for f in frames]).reshape(len(frames), -1)
+    unit = video / np.linalg.norm(video, axis=1, keepdims=True)
+    return {"prompt": prompt,
+            "guidance": torch.stack(ctrl.guidance)[:, 0].tolist(),
+            "eot_share": {b: torch.stack(v).mean((0, 2, 3)).tolist() for b, v in eot.items()},
+            "frame_change": np.abs(np.diff(video, axis=0)).mean(1).tolist(),
+            "frame_similarity": (unit @ unit[0]).tolist()}
+
+
+def plot_memorization_signals(runs, path):
+    """runs: list of (label, signals) from memorization_signals(). One line per run in every panel."""
+    fig, axes = plt.subplots(2, 3, figsize=(20, 9), layout="constrained")
+    colors = plt.get_cmap("tab10")
+    for c, (label, sig) in enumerate(runs):
+        color = colors(c % 10)
+        g = np.array(sig["guidance"])  # [steps, frames]: line = max over frames, band = min..max over frames
+        axes[0, 0].plot(g.max(1), color=color, label=label)
+        axes[0, 0].fill_between(range(len(g)), g.min(1), g.max(1), color=color, alpha=0.15)
+        for ax, block in zip([axes[0, 1], axes[0, 2], axes[1, 0]], ["down", "mid", "up"]):
+            if block in sig["eot_share"]:
+                ax.plot(sig["eot_share"][block], color=color, label=label)
+        axes[1, 1].plot(range(1, len(sig["frame_change"]) + 1), sig["frame_change"], color=color, marker="o", ms=3, label=label)
+        axes[1, 2].plot(sig["frame_similarity"], color=color, marker="o", ms=3, label=label)
+    titles = [
+        ("text guidance strength ||eps_cond - eps_null||\nline = max over frames, band = min..max (high = memorized)", "diffusion step"),
+        ("share of cross-attention on <eot> + padding, down blocks\n(mean over layers, frames, heads, pixels; stays high = memorized)", "diffusion step"),
+        ("share of cross-attention on <eot> + padding, mid block", "diffusion step"),
+        ("share of cross-attention on <eot> + padding, up blocks", "diffusion step"),
+        ("change between consecutive frames (mean |pixel difference|)", "frame f vs f-1"),
+        ("similarity of each frame to frame 0 (cosine)", "frame"),
+    ]
+    for ax, (title, xlabel) in zip(axes.flat, titles):
+        ax.set_title(title, fontsize=9)
+        ax.set_xlabel(xlabel)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=7)
+    save(fig, path)

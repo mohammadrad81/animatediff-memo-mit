@@ -65,6 +65,8 @@ def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=
         else:
             eps_null, eps_cond = eps
             noise = eps_null + s * (eps_cond - eps_null)
+            if ctrl.record:  # strength of the text guidance per video and frame (Wen et al.): [videos, frames]
+                ctrl.guidance.append((eps_cond - eps_null).float().transpose(1, 2).flatten(2).norm(dim=-1).cpu())
         latents = pipe.scheduler.step(noise, t, latents).prev_sample
 
     torch.cuda.empty_cache()

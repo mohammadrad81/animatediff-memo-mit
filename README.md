@@ -116,6 +116,8 @@ Output in `outputs/attention/`:
 
 ```
 video.gif                    the generated video
+memorization_signals.png     signals that separate memorized from normal prompts (see section 5)
+memorization_signals.json    the same numbers, for `compare`
 cross_summary.png            like Fig. 1 of the paper: attention per token in the first and last step,
                              and the attention on <eot> over the steps
 spikes.txt                   every layer's spiky tokens / key frames / pixel locations, with in how many
@@ -381,14 +383,42 @@ with the batch size and the denoising loop amplifies it (mean pixel difference �
 Run time is about 33 s per video for normal and 49 s for GUARD (or soften with `--soften-r`), so the
 three experiments together take about 2 minutes per prompt at the default settings.
 
+### 5. Compare memorized and non-memorized prompts
+
+The spike plots do **not** tell a memorized prompt from a normal one. The z-score flags tokens that stand
+out *within* a prompt, so every prompt has spikes. GUARD uses them only to choose *which* tokens to
+attenuate, assuming the prompt is memorized. What does differ is how strongly the prompt drives the
+generation and how that changes over the steps. The `attention` command therefore also writes
+`memorization_signals.png`. To overlay several runs in one figure:
+
+```bash
+python main.py attention --prompt "As Punisher Joins <i>Daredevil</i> Season Two, Who Will the New Villain Be?" --out outputs/attention-punisher
+python main.py attention --prompt "A fluffy orange cat walking slowly through a green garden" --out outputs/attention-cat
+python main.py compare outputs/attention-punisher outputs/attention-cat --out outputs/compare.png
+```
+
+`compare` only reads each folder's `memorization_signals.json`, so it takes seconds and loads no model.
+Use the same `--frames --steps --height --width --seed --s` for every run you compare.
+
+| panel | what it is | memorized prompts (in our tests) |
+|---|---|---|
+| text guidance strength | `‖ε_cond − ε_null‖` per frame at every step (Wen et al.). Line = max over frames, band = min..max | much larger in the **second half** of denoising (e.g. 11 vs 2–4 at step 12). Unlike SD, no gap at step 0 |
+| `<eot>` + padding share, down / mid / up | the share of cross-attention on `<eot>` and the padding tokens (Ren et al.; GUARD Fig. 7), **mean** over the block's layers, frames, heads and query pixels | does not fade: at the last step 0.04–0.06 (down) vs 0.01, and 0.09–0.19 (mid) vs 0.04–0.07 |
+| change between consecutive frames | mean `|pixel difference|` between frame f and f−1 | larger: the video flickers or breaks apart instead of moving smoothly |
+| similarity to frame 0 | cosine similarity of each frame to the first one | drops lower |
+
+These come from 2 memorized and 2 normal prompts, so treat them as hints, not as a validated detector.
+The `<eot>` share and the frame change are the only averaged quantities in the project. A share of
+attention is a sum over tokens, and it is only meaningful as an average over the pixels that attend.
+
 ## Code
 
 | file | content |
 |---|---|
-| `main.py` | command line (`attention`, `guard`, `soften`, `batch`); `experiment()` builds the normal / guard / soften setup that all commands share |
+| `main.py` | command line (`attention`, `guard`, `soften`, `batch`, `compare`); `experiment()` builds the normal / guard / soften setup that all commands share |
 | `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams) |
 | `attention.py` | the attention processor put in every layer: `spike_scores` / `find_spikes` (detector), `Processor.attenuated` (GUARD), `Processor.softened` (temperature), `Processor.recorded` (stores maps for plots), `select_layers` (layer choice for `soften`) |
-| `plots.py` | all figures and the text summaries |
+| `plots.py` | all figures and the text summaries; `memorization_signals` / `plot_memorization_signals` for section 5 |
 
 ## Notes
 
