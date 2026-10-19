@@ -21,6 +21,35 @@ def load_pipeline(device="cuda", dtype=torch.float16):
 
 
 @torch.no_grad()
+def embed_prompts(pipe, prompts, ctrl=None):
+    """CLIP text embeddings [prompts, 77, 768]. With ctrl.clip_mode set, the CLIP-embedding mitigation of Kim & No
+    ("Memorization in Stable Diffusion is unexpectedly driven by CLIP embeddings") is applied:
+      [v_sot, v_pr_1..v_pr_n, v_eot, v_pad_1..v_pad_d]   normal: every <pad> is another <eot> token, so the
+                                                          v_pad are near copies of v_eot and amplify it
+      "pad":  the prompt is padded with the "!" token instead of <eot> (v_pad no longer copy v_eot),
+              and v_eot is set to 0 (unless ctrl.mask_eot is False)
+      "mask": normal padding, but the first mask_ratio (default 70%) of the v_pad, the ones right after <eot>,
+              are set to 0"""
+    tok, L = pipe.tokenizer, pipe.tokenizer.model_max_length
+    mode = ctrl.clip_mode if ctrl is not None else None
+    if mode == "pad":
+        rows = [tok(p, truncation=True, max_length=L).input_ids for p in prompts]  # <sot> ... <eot>, no padding
+        bang = tok.convert_tokens_to_ids("!")
+        ids = torch.tensor([r + [bang] * (L - len(r)) for r in rows])
+    else:
+        ids = tok(prompts, padding="max_length", max_length=L, truncation=True, return_tensors="pt").input_ids
+    emb = pipe.text_encoder(ids.to(pipe.device))[0].clone()
+    for i, row in enumerate(ids.tolist()):
+        eot = row.index(tok.eos_token_id)  # first <eot> = end of the prompt
+        if mode == "pad" and ctrl.mask_eot:
+            emb[i, eot] = 0
+        elif mode == "mask":
+            d = L - 1 - eot                          # number of padding embeddings
+            emb[i, eot + 1:eot + 1 + round(ctrl.mask_ratio * d)] = 0
+    return emb
+
+
+@torch.no_grad()
 def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=0,
            s=7.5, r=0.0, r_schedule="cosine"):
     """Generate a video and return it as a list of PIL images.
@@ -37,14 +66,9 @@ def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=
     """
     device, dtype = pipe.device, pipe.unet.dtype
 
-    def embed(text):
-        ids = pipe.tokenizer(text, padding="max_length", max_length=pipe.tokenizer.model_max_length,
-                             truncation=True, return_tensors="pt").input_ids
-        return pipe.text_encoder(ids.to(device))[0]  # [texts, 77, 768]
-
     prompts = [prompt] if isinstance(prompt, str) else list(prompt)
-    e_prompt = embed(prompts)                          # [videos, 77, 768]
-    e_null = embed("").expand_as(e_prompt)
+    e_prompt = embed_prompts(pipe, prompts, ctrl)       # [videos, 77, 768]
+    e_null = embed_prompts(pipe, [""]).expand_as(e_prompt)  # the empty prompt is never changed
     # Positive and negative streams use the same prompt; only the attention inside the UNet differs.
     # Rows are ordered stream, video, frame, so each stream is still one contiguous block for the processors.
     streams = [e_null, e_prompt, e_prompt] if ctrl.num_streams == 3 else [e_null, e_prompt]

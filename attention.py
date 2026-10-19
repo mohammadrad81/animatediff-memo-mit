@@ -59,7 +59,7 @@ class Controller:
     """State shared by all attention processors."""
 
     def __init__(self, num_streams, record=False, guard_layers=(), tau=3.0, alpha=0.3,
-                 soft_layers=(), temperature=1.0, keep_sot=False):
+                 soft_layers=(), temperature=1.0, keep_sot=False, clip_mode=None, mask_eot=True, mask_ratio=0.7):
         self.num_streams = num_streams          # 2 = CFG, 3 = GUARD (or soften with repulsion)
         self.record = record                    # store attention maps of stream 1
         self.guard_layers = set(guard_layers)   # cross-attn layers where GUARD attenuates spikes
@@ -67,6 +67,10 @@ class Controller:
         self.soft_layers = set(soft_layers)     # layers (any kind) whose attention is softened
         self.temperature = temperature          # logits are divided by it (> 1 = softer, < 1 = sharper)
         self.keep_sot = keep_sot                # cross-attn: keep the mass on <sot>, soften tokens 1..76 only
+        # CLIP-embedding mitigation (Kim & No, "Memorization ... driven by CLIP embeddings"), see sampler.embed_prompts:
+        self.clip_mode = clip_mode              # None, "pad" (<pad> -> "!") or "mask" (zero part of v_pad)
+        self.mask_eot = mask_eot                # "pad" mode: also set v_eot to 0
+        self.mask_ratio = mask_ratio            # "mask" mode: share of v_pad (nearest to <eot>) set to 0
         self.maps = {}     # layer -> list over steps of (attn, peak)  (filled when record=True)
         self.spikes = {}   # layer -> list over steps of ([77] count of attenuated (frame, head) rows, number of rows)
         self.soft_stats = {}  # layer -> list over steps of {"entropy"/"top"/"sot": (before, after)}

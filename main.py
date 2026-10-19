@@ -1,4 +1,4 @@
-"""Command line interface. See README.md, or run:  python main.py {attention,guard,soften,batch,compare} --help"""
+"""Command line interface. See README.md, or run:  python main.py {attention,guard,soften,clip,batch,compare} --help"""
 import argparse
 import csv
 import json
@@ -45,6 +45,14 @@ def soften_args(p, r_flag="--r"):
                    help="repulsion of softening from the normal prediction, as in GUARD (0 = plain CFG on the softened stream)")
 
 
+def clip_args(p):
+    p.add_argument("--clip-mode", choices=["pad", "mask"], default="pad",
+                   help="pad: pad the prompt with '!' instead of <eot> and set v_eot to 0; mask: set part of v_pad to 0")
+    p.add_argument("--keep-eot", action="store_true", help="pad mode: keep v_eot (only replace the padding token)")
+    p.add_argument("--mask-ratio", type=float, default=0.7,
+                   help="mask mode: share of the padding embeddings (the ones right after <eot>) set to 0")
+
+
 def schedule_arg(p):
     p.add_argument("--r-schedule", choices=["cosine", "constant"], default="cosine",
                    help="cosine: r decays to 0 over the steps (official GUARD code); constant: fixed r (paper Eq. 5)")
@@ -59,12 +67,15 @@ def soften_layers(args, unet):
 
 
 def experiment(name, args, unet, soft_layers=()):
-    """Controller and repulsion scale r of one experiment: normal (plain AnimateDiff), guard or soften."""
+    """Controller and repulsion scale r of one experiment: normal (plain AnimateDiff), guard, soften or clip."""
     if name == "normal":  # no recording, no attenuation = plain AnimateDiff
         return Controller(num_streams=2), 0.0
     if name == "guard":
         layers = cross_layers(unet, args.blocks.split(","))
         return Controller(num_streams=3, guard_layers=layers, tau=args.tau, alpha=args.alpha), args.guard_r
+    if name == "clip":  # only the prompt's text embeddings change; normal attention and CFG
+        return Controller(num_streams=2, clip_mode=args.clip_mode, mask_eot=not args.keep_eot,
+                          mask_ratio=args.mask_ratio), 0.0
     return Controller(num_streams=3 if args.soften_r > 0 else 2, soft_layers=soft_layers,
                       temperature=args.temperature, keep_sot=args.keep_sot), args.soften_r
 
@@ -86,6 +97,24 @@ def run_attention(args, pipe):
                               os.path.join(args.out, "memorization_signals.png"))
     steps = [int(t) for t in args.plot_steps.split(",")] if args.plot_steps else None  # None = all steps
     plot_all(ctrl.maps, labels, eot, args.tau, (args.height // 8, args.width // 8), args.out, steps)
+
+
+def run_clip(args, pipe):
+    """CLIP-embedding mitigation (Kim & No), and optionally the plain CFG video for comparison."""
+    common = (args.frames, args.steps, args.height, args.width, args.seed, args.s)
+    if args.baseline:
+        plain, _ = experiment("normal", args, pipe.unet)
+        install(pipe.unet, plain)
+        baseline = sample(pipe, args.prompt, plain, *common)
+        save_gif(baseline, os.path.join(args.out, "baseline.gif"), args.fps)
+    ctrl, _ = experiment("clip", args, pipe.unet)
+    install(pipe.unet, ctrl)
+    frames = sample(pipe, args.prompt, ctrl, *common)
+    save_gif(frames, os.path.join(args.out, "clip.gif"), args.fps)
+    if args.baseline:  # baseline | clip next to each other
+        both = [Image.fromarray(np.hstack([a, b])) for a, b in zip(baseline, frames)]
+        save_gif(both, os.path.join(args.out, "baseline_vs_clip.gif"), args.fps)
+    print(f"done: {args.out}")
 
 
 def run_compare(args):
@@ -148,7 +177,7 @@ def run_soften(args, pipe):
     print(f"done: {args.out}")
 
 
-EXPERIMENTS = ["normal", "guard", "soften"]
+EXPERIMENTS = ["normal", "guard", "soften", "clip"]
 NOT_SETTINGS = ["start", "end", "batch_size", "experiments"]  # args that do not change the generated videos
 PATHS = ["csv", "out"]  # stored in settings.json, but may change (moved folder, sheet split into files)
 
@@ -176,7 +205,8 @@ def run_batch(args, pipe):
     if os.path.exists(settings_path):
         with open(settings_path) as f:
             old = json.load(f)
-        changed = ", ".join(k for k in settings.keys() | old.keys() if k not in PATHS and settings.get(k) != old.get(k))
+        changed = ", ".join(k for k in settings.keys() | old.keys()  # options added later are missing from old files
+                           if k not in PATHS and k in old and settings.get(k) != old.get(k))
         if changed:
             raise SystemExit(f"{args.out} was made with other settings ({changed}); use another --out")
     with open(settings_path, "w") as f:
@@ -226,16 +256,22 @@ def main():
     schedule_arg(t)
     t.add_argument("--baseline", action="store_true", help="also generate the plain AnimateDiff video (same seed)")
 
-    b = sub.add_parser("batch", help="run normal / guard / soften on every prompt of a CSV sheet")
+    b = sub.add_parser("batch", help="run normal / guard / soften / clip on every prompt of a CSV sheet")
     video_args(b, "outputs/batch", prompt=False)
     b.add_argument("--csv", required=True, help="CSV file with the columns 'index' and 'caption'")
-    b.add_argument("--experiments", default="normal,guard,soften", help="any of normal,guard,soften")
+    b.add_argument("--experiments", default="normal,guard,soften,clip", help="any of normal,guard,soften,clip")
     b.add_argument("--start", type=int, default=0, help="first CSV row to run (0 = first data row)")
     b.add_argument("--end", type=int, default=None, help="stop before this CSV row (default: the end of the sheet)")
     b.add_argument("--batch-size", type=int, default=1, help="prompts generated together in one UNet pass")
     guard_args(b, r_flag="--guard-r")
     soften_args(b, r_flag="--soften-r")
+    clip_args(b)
     schedule_arg(b)
+
+    k = sub.add_parser("clip", help="generate a video with the CLIP-embedding mitigation (pad with '!' / mask v_pad)")
+    video_args(k, "outputs/clip")
+    clip_args(k)
+    k.add_argument("--baseline", action="store_true", help="also generate the plain AnimateDiff video (same seed)")
 
     c = sub.add_parser("compare", help="overlay the memorization signals of several attention runs")
     c.add_argument("dirs", nargs="+", help="output folders of the attention command")
@@ -250,6 +286,8 @@ def main():
         run_attention(args, pipe)
     elif args.command == "guard":
         run_guard(args, pipe)
+    elif args.command == "clip":
+        run_clip(args, pipe)
     elif args.command == "soften":
         run_soften(args, pipe)
     else:

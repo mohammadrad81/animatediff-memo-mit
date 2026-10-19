@@ -11,9 +11,10 @@ layers with a temperature.
 - Model: `CompVis/stable-diffusion-v1-4` + motion adapter `guoyww/animatediff-motion-adapter-v1-4`
 - Four commands:
   - `attention` generates a video, then plots spatial, cross- and temporal attention for every layer, head, frame and diffusion step, with spikes marked.
-  - `generate` generates a video with GUARD (and, optionally, the normal video for comparison).
+  - `guard` generates a video with GUARD (and, optionally, the normal video for comparison).
   - `soften` generates a video with temperature-softened attention in the layers you choose (and, optionally, the normal video).
-  - `batch` runs any of these experiments (normal, GUARD, soften) on every prompt of a CSV sheet and saves the GIFs.
+  - `clip` generates a video with the CLIP-embedding mitigation of Kim & No (padding / `<eot>` embeddings changed).
+  - `batch` runs any of these experiments (normal, GUARD, soften, clip) on every prompt of a CSV sheet and saves the GIFs.
 
 ## The method in short
 
@@ -305,6 +306,39 @@ no statistics are computed for them.
 `soften` (cross-attention of `down,mid`, `--r 0`) touches the same layers as `python main.py guard
 --r 0`, the paper's "CA attenuation" alone. Add `--r 2` to both to compare with full CA-in-GUARD.
 
+### 3b. CLIP-embedding mitigation (`clip`)
+
+From *"Memorization in Stable Diffusion Is Unexpectedly Driven by CLIP Embeddings"* (Kim & No, 2026,
+[code](https://github.com/quasar529/sd-clip-mem)). SD v1.4's tokenizer pads every prompt to 77 tokens by
+repeating `<eot>`. The padding embeddings `v_pad` are therefore near copies of `v_eot`, the only
+embedding CLIP is trained to make meaningful, and these copies amplify it. The paper finds that this, not
+the prompt-word embeddings, drives memorization. AnimateDiff uses the same CLIP text encoder, so the
+fix carries over unchanged. It edits only the prompt's text embeddings, once, before denoising.
+Attention and CFG are normal, there is no detection step, and it costs no extra time.
+
+```
+normal: [v_sot, v_pr_1 .. v_pr_n, v_eot, v_pad_1 .. v_pad_d]      (<pad> = <eot>)
+pad:    [v_sot, v_pr_1 .. v_pr_n, 0,     v_!_1   .. v_!_d  ]      (<pad> = "!", v_eot -> 0)
+mask:   [v_sot, v_pr_1 .. v_pr_n, v_eot, 0 .. 0, v_pad .. v_pad]  (first 70% of v_pad -> 0)
+```
+
+```bash
+python main.py clip --prompt "Living in the Light with Ann Graham Lotz" --baseline     # pad mode (paper's main method)
+python main.py clip --prompt "..." --clip-mode pad --keep-eot                          # only replace <pad> by "!"
+python main.py clip --prompt "..." --clip-mode mask --mask-ratio 0.7                   # partial masking of v_pad
+```
+
+| option | default | meaning |
+|---|---|---|
+| `--clip-mode` | `pad` | `pad`: pad with `!` and set `v_eot` to 0; `mask`: set part of `v_pad` to 0 |
+| `--keep-eot` | off | `pad` mode: keep `v_eot` (the paper's weaker variant "`<pad>` → `!`") |
+| `--mask-ratio` | 0.7 | `mask` mode: share of the padding embeddings, starting right after `<eot>`, set to 0 (paper: 70%; 100% degrades quality) |
+| `--baseline` | off | also make the normal video (same seed) |
+
+Output in `outputs/clip/`: `clip.gif`, plus `baseline.gif` and `baseline_vs_clip.gif` with `--baseline`.
+Only the prompt's embeddings are changed; the empty prompt used for CFG stays normal. Prompts that fill
+all 77 tokens have no padding, so `mask` then changes nothing (and `pad` only zeroes `v_eot`).
+
 ### 4. Run the experiments on a CSV sheet of prompts
 
 The sheet must have a column `caption` (the prompt) and a column `index` (used as the file name). Other
@@ -317,7 +351,7 @@ index,caption
 ```
 
 ```bash
-# all three experiments on the whole sheet
+# all four experiments on the whole sheet
 python main.py batch --csv prompts.csv --out outputs/my_run
 
 # only normal inference and GUARD
@@ -363,11 +397,12 @@ videos made with different settings are never mixed. Use a new `--out` for each 
 |---|---|---|
 | `--csv` | (required) | the sheet, with columns `index` and `caption` |
 | `--out` | `outputs/batch` | output folder |
-| `--experiments` | `normal,guard,soften` | which experiments to run |
+| `--experiments` | `normal,guard,soften,clip` | which experiments to run |
 | `--start`, `--end` | whole sheet | rows to run |
 | `--batch-size` | 1 | prompts generated together in one UNet pass (see below) |
 | `--guard-r`, `--alpha`, `--tau`, `--blocks` | 2.0, 0.3, 0.1, `down,mid` | GUARD settings, as in `guard` (`--guard-r` is `guard`'s `--r`) |
 | `-T`, `--kinds`, `--layers`, `--keep-sot`, `--soften-r` | 2.0, `cross`, `down,mid`, off, 0 | soften settings, as in `soften` (`--soften-r` is `soften`'s `--r`) |
+| `--clip-mode`, `--keep-eot`, `--mask-ratio` | `pad`, off, 0.7 | clip settings, as in `clip` |
 | `--r-schedule` | `cosine` | schedule of both `--guard-r` and `--soften-r` |
 
 `--frames`, `--steps`, `--height`, `--width`, `--seed`, `--s` and `--fps` are the same as in the other commands.
@@ -415,8 +450,8 @@ attention is a sum over tokens, and it is only meaningful as an average over the
 
 | file | content |
 |---|---|
-| `main.py` | command line (`attention`, `guard`, `soften`, `batch`, `compare`); `experiment()` builds the normal / guard / soften setup that all commands share |
-| `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams) |
+| `main.py` | command line (`attention`, `guard`, `soften`, `clip`, `batch`, `compare`); `experiment()` builds the normal / guard / soften / clip setup that all commands share |
+| `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams); `embed_prompts` builds the text embeddings, including the `clip` mitigation |
 | `attention.py` | the attention processor put in every layer: `spike_scores` / `find_spikes` (detector), `Processor.attenuated` (GUARD), `Processor.softened` (temperature), `Processor.recorded` (stores maps for plots), `select_layers` (layer choice for `soften`) |
 | `plots.py` | all figures and the text summaries; `memorization_signals` / `plot_memorization_signals` for section 5 |
 
