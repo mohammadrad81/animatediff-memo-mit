@@ -1,8 +1,11 @@
 """Load AnimateDiff and run the denoising loop (normal CFG or GUARD)."""
+import contextlib
+import functools
 import math
 
 import torch
 from diffusers import AnimateDiffPipeline, DDIMScheduler, MotionAdapter
+from torch.utils.checkpoint import checkpoint
 from tqdm import tqdm
 
 MODEL_ID = "CompVis/stable-diffusion-v1-4"
@@ -17,6 +20,7 @@ def load_pipeline(device="cuda", dtype=torch.float16):
         MODEL_ID, subfolder="scheduler", beta_schedule="linear", clip_sample=False,
         timestep_spacing="linspace", steps_offset=1)
     pipe.set_progress_bar_config(disable=True)
+    pipe.unet.requires_grad_(False)  # inference only (the noise adjustment needs gradients for the latent alone)
     return pipe.to(device)
 
 
@@ -49,6 +53,89 @@ def embed_prompts(pipe, prompts, ctrl=None):
     return emb
 
 
+def frame_norm(d):
+    """[videos, 4, frames, h, w] -> [videos, frames]: L2 norm of every frame (each frame is like one SD image)."""
+    return d.float().transpose(1, 2).flatten(2).norm(dim=-1)
+
+
+def guidance_eps(pipe, x, t, e_null, e_prompt):
+    """eps_cond - eps_null (the paper's eps~) at latents x [videos, 4, frames, h, w], in float32."""
+    text = torch.cat([e_null, e_prompt]).repeat_interleave(x.shape[2], dim=0)
+    x = pipe.scheduler.scale_model_input(x.to(pipe.unet.dtype), t)
+    eps_null, eps_cond = pipe.unet(torch.cat([x, x]), t, encoder_hidden_states=text).sample.chunk(2)
+    return (eps_cond - eps_null).float()
+
+
+@contextlib.contextmanager
+def checkpointed_blocks(unet):
+    """Recompute every UNet block in the backward pass instead of storing its activations. Without this, the
+    gradient through the 16-frame UNet does not fit in 16 GB (with it: about 12 GB at 512x512)."""
+    blocks = [*unet.down_blocks, unet.mid_block, *unet.up_blocks]
+    for b in blocks:
+        b.forward = functools.partial(checkpoint, b.forward, use_reentrant=False)
+    try:
+        yield
+    finally:
+        for b in blocks:
+            del b.forward  # back to the class's own forward
+
+
+def adjust_noise(pipe, x, t, e_null, e_prompt, ctrl):
+    """Initial-noise adjustment of Han et al., "Adjusting Initial Noise to Mitigate Memorization in Text-to-Image
+    Diffusion Models" (NeurIPS 2025). x: [videos, 4, frames, h, w] initial noise x_T, t: first timestep T.
+    The idea: x_T with a small ||eps~(x_T, T, y)|| = ||eps_cond - eps_null|| escapes the "attraction basin"
+    (where CFG pulls towards the memorized image) earlier. AnimateDiff denoises every frame like an SD image,
+    so norms and the step delta are taken per frame.
+
+    "batch" (Algorithm 1), M times, with no gradients:
+        delta = rho * eps~(x) / ||eps~(x)||                (per frame)
+        x     = x - gamma * (eps~(x + delta) - eps~(x))    (sharpness-aware step towards a smaller ||eps~||)
+    "sample" (Appendix A): AdamW on x minimising sum over frames of ||eps~(x)||, for each video on its own,
+        until every frame has ||eps~|| <= target (or max_iters steps)."""
+    x = x.float()
+    before = frame_norm(guidance_eps(pipe, x, t, e_null, e_prompt))
+    steps = [0] * x.shape[0]
+    if ctrl.noise_mode == "batch":
+        for _ in range(ctrl.adj_iters):
+            d = guidance_eps(pipe, x, t, e_null, e_prompt)
+            delta = ctrl.rho * d / frame_norm(d)[:, None, :, None, None]
+            x = x - ctrl.gamma * (guidance_eps(pipe, x + delta, t, e_null, e_prompt) - d)
+    else:
+        frames = x.shape[2]
+        videos = []
+        for v in range(x.shape[0]):
+            lat = x[v:v + 1].clone().requires_grad_(True)
+            optim = torch.optim.AdamW([lat], lr=ctrl.lr)  # default weight decay 0.01 keeps x near N(0, I)
+            en, ep = e_null[v:v + 1], e_prompt[v:v + 1]
+            pbar = tqdm(range(ctrl.max_iters), desc="adjusting noise")
+            for steps[v] in pbar:
+                d = guidance_eps(pipe, lat.detach(), t, en, ep)
+                n = frame_norm(d)
+                pbar.set_postfix(max_norm=f"{n.max():.3f}", target=ctrl.target)
+                if n.max() <= ctrl.target:
+                    break
+                # Gradient of sum_f ||eps_cond - eps_null|| = J_cond^T g - J_null^T g with g = eps~ / ||eps~||.
+                # Computing the two streams one after the other halves the memory of one backward pass.
+                g = d / n[:, None, :, None, None]
+                optim.zero_grad()
+                with torch.enable_grad(), checkpointed_blocks(pipe.unet):
+                    for e, sign in [(ep, 1.0), (en, -1.0)]:
+                        xin = pipe.scheduler.scale_model_input(lat.to(pipe.unet.dtype), t)
+                        out = pipe.unet(xin, t, encoder_hidden_states=e.repeat_interleave(frames, dim=0)).sample
+                        out.float().backward(sign * g)
+                optim.step()
+            else:
+                steps[v] = ctrl.max_iters
+            videos.append(lat.detach())
+        x = torch.cat(videos)
+    after = frame_norm(guidance_eps(pipe, x, t, e_null, e_prompt))
+    for v in range(x.shape[0]):
+        ctrl.noise_log.append((before[v].tolist(), after[v].tolist(), steps[v]))
+        print(f"initial noise adjusted ({ctrl.noise_mode}): max over frames of ||eps_cond - eps_null|| "
+              f"{before[v].max():.3f} -> {after[v].max():.3f}" + (f" in {steps[v]} steps" if ctrl.noise_mode == "sample" else ""))
+    return x.to(pipe.unet.dtype)
+
+
 @torch.no_grad()
 def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=0,
            s=7.5, r=0.0, r_schedule="cosine"):
@@ -78,6 +165,8 @@ def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=
     latents = torch.cat([torch.randn((1, 4, frames, height // 8, width // 8), generator=torch.Generator(device).manual_seed(seed),
                                      device=device, dtype=dtype) for _ in prompts])
     latents = latents * pipe.scheduler.init_noise_sigma
+    if ctrl.noise_mode:  # initial-noise adjustment (Han et al.)
+        latents = adjust_noise(pipe, latents, pipe.scheduler.timesteps[0], e_null, e_prompt, ctrl)
 
     for i, t in enumerate(tqdm(pipe.scheduler.timesteps, desc="denoising")):
         x = pipe.scheduler.scale_model_input(torch.cat([latents] * len(streams)), t)
@@ -89,6 +178,8 @@ def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=
         else:
             eps_null, eps_cond = eps
             noise = eps_null + s * (eps_cond - eps_null)
+            if ctrl.cfg_start is not None and t > ctrl.cfg_start:  # CFG delayed: unconditional prediction only
+                noise = eps_null
             if ctrl.record:  # strength of the text guidance per video and frame (Wen et al.): [videos, frames]
                 ctrl.guidance.append((eps_cond - eps_null).float().transpose(1, 2).flatten(2).norm(dim=-1).cpu())
         latents = pipe.scheduler.step(noise, t, latents).prev_sample

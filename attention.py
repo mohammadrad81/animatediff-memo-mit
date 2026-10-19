@@ -59,7 +59,9 @@ class Controller:
     """State shared by all attention processors."""
 
     def __init__(self, num_streams, record=False, guard_layers=(), tau=3.0, alpha=0.3,
-                 soft_layers=(), temperature=1.0, keep_sot=False, clip_mode=None, mask_eot=True, mask_ratio=0.7):
+                 soft_layers=(), temperature=1.0, keep_sot=False, clip_mode=None, mask_eot=True, mask_ratio=0.7,
+                 noise_mode=None, rho=50.0, gamma=0.7, adj_iters=2, lr=0.01, target=0.25, max_iters=100,
+                 cfg_start=None):
         self.num_streams = num_streams          # 2 = CFG, 3 = GUARD (or soften with repulsion)
         self.record = record                    # store attention maps of stream 1
         self.guard_layers = set(guard_layers)   # cross-attn layers where GUARD attenuates spikes
@@ -71,6 +73,16 @@ class Controller:
         self.clip_mode = clip_mode              # None, "pad" (<pad> -> "!") or "mask" (zero part of v_pad)
         self.mask_eot = mask_eot                # "pad" mode: also set v_eot to 0
         self.mask_ratio = mask_ratio            # "mask" mode: share of v_pad (nearest to <eot>) set to 0
+        # Initial-noise adjustment (Han et al., "Adjusting Initial Noise to Mitigate Memorization"), see
+        # sampler.adjust_noise:
+        self.noise_mode = noise_mode            # None, "batch" (batch-wise) or "sample" (per-sample)
+        self.rho, self.gamma = rho, gamma       # batch-wise: sharpness radius and adjustment strength
+        self.adj_iters = adj_iters              # batch-wise: number of adjustments M
+        self.lr, self.target = lr, target       # per-sample: AdamW learning rate, target ||eps_cond - eps_null||
+        self.max_iters = max_iters              # per-sample: stop after this many AdamW steps at the latest
+        self.cfg_start = cfg_start              # CFG only at timesteps t <= cfg_start (None = from the start);
+                                                # before that the unconditional prediction alone is used
+        self.noise_log = []                     # per video: (per-frame norms before, after, AdamW steps)
         self.maps = {}     # layer -> list over steps of (attn, peak)  (filled when record=True)
         self.spikes = {}   # layer -> list over steps of ([77] count of attenuated (frame, head) rows, number of rows)
         self.soft_stats = {}  # layer -> list over steps of {"entropy"/"top"/"sot": (before, after)}

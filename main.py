@@ -1,4 +1,4 @@
-"""Command line interface. See README.md, or run:  python main.py {attention,guard,soften,clip,batch,compare} --help"""
+"""Command line interface. See README.md, or run:  python main.py {attention,guard,soften,clip,noise,batch,compare} --help"""
 import argparse
 import csv
 import json
@@ -53,6 +53,28 @@ def clip_args(p):
                    help="mask mode: share of the padding embeddings (the ones right after <eot>) set to 0")
 
 
+def noise_args(p):
+    p.add_argument("--noise-mode", choices=["batch", "sample"], default="sample",
+                   help="batch: batch-wise adjustment (Algorithm 1, delayed CFG); sample: per-sample AdamW adjustment")
+    p.add_argument("--rho", type=float, default=50.0, help="batch: sharpness radius rho (per frame)")
+    p.add_argument("--gamma", type=float, default=0.7, help="batch: adjustment strength gamma~")
+    p.add_argument("--adj-iters", type=int, default=2, help="batch: number of adjustments M")
+    p.add_argument("--lr", type=float, default=0.01, help="sample: AdamW learning rate")
+    p.add_argument("--target", type=float, default=0.2,
+                   help="sample: adjust until every frame has ||eps_cond - eps_null|| <= target")
+    p.add_argument("--max-iters", type=int, default=100, help="sample: at most this many AdamW steps")
+    p.add_argument("--cfg-start", type=float, default=None,
+                   help="apply CFG only at timesteps t <= this, unconditional before (default: 900 for batch, "
+                        "from the start for sample; 1000 = from the start)")
+
+
+def noise_controller(args):
+    cfg_start = args.cfg_start if args.cfg_start is not None else (900.0 if args.noise_mode == "batch" else None)
+    return Controller(num_streams=2, noise_mode=args.noise_mode, rho=args.rho, gamma=args.gamma,
+                      adj_iters=args.adj_iters, lr=args.lr, target=args.target, max_iters=args.max_iters,
+                      cfg_start=cfg_start)
+
+
 def schedule_arg(p):
     p.add_argument("--r-schedule", choices=["cosine", "constant"], default="cosine",
                    help="cosine: r decays to 0 over the steps (official GUARD code); constant: fixed r (paper Eq. 5)")
@@ -67,12 +89,14 @@ def soften_layers(args, unet):
 
 
 def experiment(name, args, unet, soft_layers=()):
-    """Controller and repulsion scale r of one experiment: normal (plain AnimateDiff), guard, soften or clip."""
+    """Controller and repulsion scale r of one experiment: normal (plain AnimateDiff), guard, soften, clip or noise."""
     if name == "normal":  # no recording, no attenuation = plain AnimateDiff
         return Controller(num_streams=2), 0.0
     if name == "guard":
         layers = cross_layers(unet, args.blocks.split(","))
         return Controller(num_streams=3, guard_layers=layers, tau=args.tau, alpha=args.alpha), args.guard_r
+    if name == "noise":  # only the initial noise changes (and CFG may start later)
+        return noise_controller(args), 0.0
     if name == "clip":  # only the prompt's text embeddings change; normal attention and CFG
         return Controller(num_streams=2, clip_mode=args.clip_mode, mask_eot=not args.keep_eot,
                           mask_ratio=args.mask_ratio), 0.0
@@ -114,6 +138,30 @@ def run_clip(args, pipe):
     if args.baseline:  # baseline | clip next to each other
         both = [Image.fromarray(np.hstack([a, b])) for a, b in zip(baseline, frames)]
         save_gif(both, os.path.join(args.out, "baseline_vs_clip.gif"), args.fps)
+    print(f"done: {args.out}")
+
+
+def run_noise(args, pipe):
+    """Initial-noise adjustment (Han et al.), and optionally the plain CFG video (same seed) for comparison."""
+    common = (args.frames, args.steps, args.height, args.width, args.seed, args.s)
+    if args.baseline:
+        plain, _ = experiment("normal", args, pipe.unet)
+        install(pipe.unet, plain)
+        baseline = sample(pipe, args.prompt, plain, *common)
+        save_gif(baseline, os.path.join(args.out, "baseline.gif"), args.fps)
+    ctrl, _ = experiment("noise", args, pipe.unet)
+    install(pipe.unet, ctrl)
+    frames = sample(pipe, args.prompt, ctrl, *common)
+    save_gif(frames, os.path.join(args.out, "noise.gif"), args.fps)
+    before, after, steps = ctrl.noise_log[0]
+    with open(os.path.join(args.out, "noise_adjustment.txt"), "w") as f:
+        f.write(f"mode {args.noise_mode}, CFG from timestep {ctrl.cfg_start or 'the start'}"
+                + (f", {steps} AdamW steps" if args.noise_mode == "sample" else "") + "\n"
+                "||eps_cond - eps_null|| at the first step, per frame, before -> after the adjustment:\n")
+        f.writelines(f"  frame {i:2d}: {b:.3f} -> {a:.3f}\n" for i, (b, a) in enumerate(zip(before, after)))
+    if args.baseline:  # baseline | adjusted noise next to each other
+        both = [Image.fromarray(np.hstack([a, b])) for a, b in zip(baseline, frames)]
+        save_gif(both, os.path.join(args.out, "baseline_vs_noise.gif"), args.fps)
     print(f"done: {args.out}")
 
 
@@ -177,7 +225,7 @@ def run_soften(args, pipe):
     print(f"done: {args.out}")
 
 
-EXPERIMENTS = ["normal", "guard", "soften", "clip"]
+EXPERIMENTS = ["normal", "guard", "soften", "clip", "noise"]
 NOT_SETTINGS = ["start", "end", "batch_size", "experiments"]  # args that do not change the generated videos
 PATHS = ["csv", "out"]  # stored in settings.json, but may change (moved folder, sheet split into files)
 
@@ -256,22 +304,28 @@ def main():
     schedule_arg(t)
     t.add_argument("--baseline", action="store_true", help="also generate the plain AnimateDiff video (same seed)")
 
-    b = sub.add_parser("batch", help="run normal / guard / soften / clip on every prompt of a CSV sheet")
+    b = sub.add_parser("batch", help="run normal / guard / soften / clip / noise on every prompt of a CSV sheet")
     video_args(b, "outputs/batch", prompt=False)
     b.add_argument("--csv", required=True, help="CSV file with the columns 'index' and 'caption'")
-    b.add_argument("--experiments", default="normal,guard,soften,clip", help="any of normal,guard,soften,clip")
+    b.add_argument("--experiments", default="normal,guard,soften,clip,noise", help="any of normal,guard,soften,clip,noise")
     b.add_argument("--start", type=int, default=0, help="first CSV row to run (0 = first data row)")
     b.add_argument("--end", type=int, default=None, help="stop before this CSV row (default: the end of the sheet)")
     b.add_argument("--batch-size", type=int, default=1, help="prompts generated together in one UNet pass")
     guard_args(b, r_flag="--guard-r")
     soften_args(b, r_flag="--soften-r")
     clip_args(b)
+    noise_args(b)
     schedule_arg(b)
 
     k = sub.add_parser("clip", help="generate a video with the CLIP-embedding mitigation (pad with '!' / mask v_pad)")
     video_args(k, "outputs/clip")
     clip_args(k)
     k.add_argument("--baseline", action="store_true", help="also generate the plain AnimateDiff video (same seed)")
+
+    n = sub.add_parser("noise", help="generate a video from adjusted initial noise (batch-wise / per-sample)")
+    video_args(n, "outputs/noise")
+    noise_args(n)
+    n.add_argument("--baseline", action="store_true", help="also generate the plain AnimateDiff video (same seed)")
 
     c = sub.add_parser("compare", help="overlay the memorization signals of several attention runs")
     c.add_argument("dirs", nargs="+", help="output folders of the attention command")
@@ -286,6 +340,8 @@ def main():
         run_attention(args, pipe)
     elif args.command == "guard":
         run_guard(args, pipe)
+    elif args.command == "noise":
+        run_noise(args, pipe)
     elif args.command == "clip":
         run_clip(args, pipe)
     elif args.command == "soften":

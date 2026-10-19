@@ -14,7 +14,8 @@ layers with a temperature.
   - `guard` generates a video with GUARD (and, optionally, the normal video for comparison).
   - `soften` generates a video with temperature-softened attention in the layers you choose (and, optionally, the normal video).
   - `clip` generates a video with the CLIP-embedding mitigation of Kim & No (padding / `<eot>` embeddings changed).
-  - `batch` runs any of these experiments (normal, GUARD, soften, clip) on every prompt of a CSV sheet and saves the GIFs.
+  - `noise` generates a video from adjusted initial noise (Han et al.: batch-wise or per-sample).
+  - `batch` runs any of these experiments (normal, GUARD, soften, clip, noise) on every prompt of a CSV sheet and saves the GIFs.
 
 ## The method in short
 
@@ -339,6 +340,67 @@ Output in `outputs/clip/`: `clip.gif`, plus `baseline.gif` and `baseline_vs_clip
 Only the prompt's embeddings are changed; the empty prompt used for CFG stays normal. Prompts that fill
 all 77 tokens have no padding, so `mask` then changes nothing (and `pad` only zeroes `v_eot`).
 
+### 3c. Initial-noise adjustment (`noise`)
+
+From *"Adjusting Initial Noise to Mitigate Memorization in Text-to-Image Diffusion Models"* (Han et al.,
+NeurIPS 2025, [code](https://github.com/hygnhan/init_noise_diffusion_memorization)).
+
+**Idea.** Memorization comes from an *attraction basin*: early in denoising, CFG pulls the trajectory
+towards the memorized image. Inside the basin, the text guidance `‖ε̃‖ = ‖ε_cond − ε_null‖` is large.
+Starting points `x_T` with a small `‖ε̃(x_T, T, y)‖` leave the basin earlier, so the method changes the
+starting noise to make `‖ε̃‖` small and then denoises normally. Attention and text embeddings are untouched.
+
+| mode | what it does (paper) | CFG |
+|---|---|---|
+| `sample` (per-sample, the paper's best) | AdamW on `x_T` (lr 0.01) minimizing `‖ε̃(x_T, T, y)‖`, until it is `≤ target` | from the first step |
+| `batch` (batch-wise, Algorithm 1) | `M` sharpness-aware steps without gradients: `δ = ρ·ε̃/‖ε̃‖`, `x_T ← x_T − γ(ε̃(x_T+δ) − ε̃(x_T))` | only for `t ≤ 900`; before that, the unconditional prediction alone |
+
+```bash
+python main.py noise --prompt "As Punisher Joins <i>Daredevil</i> Season Two, Who Will the New Villain Be?" --baseline
+python main.py noise --prompt "..." --target 0.1                       # stronger per-sample adjustment (slower)
+python main.py noise --prompt "..." --noise-mode batch                 # batch-wise, paper settings
+python main.py noise --prompt "..." --noise-mode batch --gamma 3       # batch-wise, stronger
+```
+
+| option | default | meaning |
+|---|---|---|
+| `--noise-mode` | `sample` | `sample` = per-sample, `batch` = batch-wise |
+| `--lr`, `--target`, `--max-iters` | 0.01, 0.2, 100 | per-sample: AdamW learning rate; stop when every frame has `‖ε̃‖ ≤ target`; at most this many steps |
+| `--rho`, `--gamma`, `--adj-iters` | 50, 0.7, 2 | batch-wise: sharpness radius `ρ`, strength `γ̃`, number of adjustments `M` (paper's SD v1.4 values) |
+| `--cfg-start` | 900 (batch) / start (sample) | CFG only at timesteps `t ≤ cfg-start`; `1000` = from the start |
+| `--baseline` | off | also make the normal video (same seed) |
+
+Output in `outputs/noise/`:
+- `noise.gif`, plus `baseline.gif` and `baseline_vs_noise.gif` with `--baseline`.
+- `noise_adjustment.txt`: every frame's `‖ε̃‖` at the first step, before → after the adjustment.
+
+**How it is adapted to AnimateDiff**
+- **One video is one sample.** It is one latent `[4, 16, 64, 64]`, and all frames are adjusted together;
+  they interact through the motion modules.
+- **Norms and `δ` are taken per frame.** Each frame has the same size as one SD image latent, so the
+  paper's `ρ` keeps its meaning. Per-sample stops when **every** frame is at or below `target`, and it
+  minimizes the sum of the per-frame norms.
+- **The target is recalibrated.** AnimateDiff's first-step `‖ε̃‖` per frame is about 0.5–0.65 (SD
+  images: about 6–8), so the paper's `l_target = 0.9` would change nothing. The paper's targets are
+  roughly 12–20% of the starting value. The default 0.2 (about 35%) is a compromise for speed;
+  `--target 0.1` matches the paper's ratio.
+- **Memory.** The gradient through the 16-frame UNet does not fit in 16 GB. The two streams are
+  therefore backpropagated one after the other (`∇‖ε̃‖ = J_condᵀg − J_nullᵀg`, `g = ε̃/‖ε̃‖`, the same
+  result), and every UNet block is recomputed in the backward pass instead of stored (peak about 12 GB).
+- **The latent is optimized in float32**, with AdamW's default weight decay of 0.01. The paper
+  (appendix C) notes this keeps `x_T` close to `N(0, I)`.
+- **`τ = 900` is a timestep**, so it does not depend on the number of steps. With 25 steps, CFG starts at
+  the 4th step (t = 874), as in the official code's `apply_cfg_step=4` of 50 (t ≤ 900).
+
+**Cost and first results** (punisher prompt, 512×512, 16 frames, 25 steps):
+- **Per-sample:** about 5.7 s per AdamW step. `target 0.2` took 18 steps (0.55 → 0.20, about 3 min per
+  video in total); `0.1` took 68 steps (about 6.5 min).
+- **Batch-wise:** adds only 4 UNet passes, but with the paper's `γ̃ = 0.7` it lowers `‖ε̃‖` by just 13%
+  (0.55 → 0.48). `γ̃ = 5` lowers it by 36%.
+- **What the videos looked like:** plain AnimateDiff produced a Daredevil figure like the memorized
+  image. Per-sample produced a different composition that still matches the prompt. Batch-wise drifted
+  to an abstract texture: the unconditional first steps cost prompt alignment, as the paper warns.
+
 ### 4. Run the experiments on a CSV sheet of prompts
 
 The sheet must have a column `caption` (the prompt) and a column `index` (used as the file name). Other
@@ -351,7 +413,7 @@ index,caption
 ```
 
 ```bash
-# all four experiments on the whole sheet
+# all five experiments on the whole sheet
 python main.py batch --csv prompts.csv --out outputs/my_run
 
 # only normal inference and GUARD
@@ -397,12 +459,13 @@ videos made with different settings are never mixed. Use a new `--out` for each 
 |---|---|---|
 | `--csv` | (required) | the sheet, with columns `index` and `caption` |
 | `--out` | `outputs/batch` | output folder |
-| `--experiments` | `normal,guard,soften,clip` | which experiments to run |
+| `--experiments` | `normal,guard,soften,clip,noise` | which experiments to run |
 | `--start`, `--end` | whole sheet | rows to run |
 | `--batch-size` | 1 | prompts generated together in one UNet pass (see below) |
 | `--guard-r`, `--alpha`, `--tau`, `--blocks` | 2.0, 0.3, 0.1, `down,mid` | GUARD settings, as in `guard` (`--guard-r` is `guard`'s `--r`) |
 | `-T`, `--kinds`, `--layers`, `--keep-sot`, `--soften-r` | 2.0, `cross`, `down,mid`, off, 0 | soften settings, as in `soften` (`--soften-r` is `soften`'s `--r`) |
 | `--clip-mode`, `--keep-eot`, `--mask-ratio` | `pad`, off, 0.7 | clip settings, as in `clip` |
+| `--noise-mode`, `--lr`, `--target`, `--max-iters`, `--rho`, `--gamma`, `--adj-iters`, `--cfg-start` | as in `noise` | noise settings, as in `noise` (per-sample adds about 2 min per prompt) |
 | `--r-schedule` | `cosine` | schedule of both `--guard-r` and `--soften-r` |
 
 `--frames`, `--steps`, `--height`, `--width`, `--seed`, `--s` and `--fps` are the same as in the other commands.
@@ -450,8 +513,8 @@ attention is a sum over tokens, and it is only meaningful as an average over the
 
 | file | content |
 |---|---|
-| `main.py` | command line (`attention`, `guard`, `soften`, `clip`, `batch`, `compare`); `experiment()` builds the normal / guard / soften / clip setup that all commands share |
-| `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams); `embed_prompts` builds the text embeddings, including the `clip` mitigation |
+| `main.py` | command line (`attention`, `guard`, `soften`, `clip`, `noise`, `batch`, `compare`); `experiment()` builds the normal / guard / soften / clip / noise setup that all commands share |
+| `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams); `embed_prompts` builds the text embeddings, including the `clip` mitigation; `adjust_noise` is the `noise` experiment |
 | `attention.py` | the attention processor put in every layer: `spike_scores` / `find_spikes` (detector), `Processor.attenuated` (GUARD), `Processor.softened` (temperature), `Processor.recorded` (stores maps for plots), `select_layers` (layer choice for `soften`) |
 | `plots.py` | all figures and the text summaries; `memorization_signals` / `plot_memorization_signals` for section 5 |
 
