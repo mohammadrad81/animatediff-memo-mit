@@ -62,6 +62,15 @@ Where they differ, this project follows the **official code**:
 | maps used for detection | the negative (normal) pass | the positive stream's own logits |
 | `tau` | "e.g. 3" | 0.1 for CA-in-GUARD (0.01 for CA attenuation alone) |
 | repulsion | constant `r` | `r_t = r * cos(pi/2 * step/steps)`, decays to 0 (`--r-schedule constant` for the paper's version) |
+| attraction direction | `ε⁺ − ε∅` as is | projected off `ε⁻ − ε∅` wherever their cosine is > 0.9 (see below; **not** followed here by default, `--ortho` to enable) |
+
+**About `--ortho`.** In the official `inference_mem.py`, the argument that would switch this projection off
+(`orthogonalize_neighbors=current_ortho`, set to `False` with the comment "Ortho not needed") is commented out.
+`dual_guidance_call` therefore uses its default `True`. The paper's equation has no projection, so it is off here
+by default. Measured on AnimateDiff:
+- **Memorized prompt (punisher):** the cosine is 0.05–0.84, never above 0.9, so `--ortho` changes nothing.
+- **Normal prompt (cat):** the cosine is above 0.9 for most of the steps, and the projection removes 54–86% of the
+  attraction direction, so the guidance becomes mostly repulsion from the prompt.
 
 ### How it is adapted to AnimateDiff
 
@@ -207,6 +216,7 @@ Output in `outputs/guard/`:
 | `--alpha` | 0.3 | spiky logits are multiplied by this (1 = no attenuation) |
 | `--tau` | 3.0 | spike threshold on the z-score |
 | `--blocks` | `down,mid` | UNet parts whose cross-attention is attenuated (`down`, `mid`, `up`) |
+| `--ortho` | off | do what the official code actually runs: where `ε⁺ − ε∅` and `ε⁻ − ε∅` have cosine > 0.9 (per frame), remove the `ε⁻ − ε∅` component from the attraction (coefficient clipped to ±2) |
 | `--baseline` | off | also make the normal video |
 
 The defaults are the official repo's CA-in-GUARD settings for SD v1.4. The paper's search ranges
@@ -333,11 +343,11 @@ python main.py clip --prompt "..." --clip-mode mask --mask-ratio 0.7            
 |---|---|---|
 | `--clip-mode` | `pad` | `pad`: pad with `!` and set `v_eot` to 0; `mask`: set part of `v_pad` to 0 |
 | `--keep-eot` | off | `pad` mode: keep `v_eot` (the paper's weaker variant "`<pad>` → `!`") |
-| `--mask-ratio` | 0.7 | `mask` mode: share of the padding embeddings, starting right after `<eot>`, set to 0 (paper: 70%; 100% degrades quality) |
+| `--mask-ratio` | 0.7 | `mask` mode: share of the padding embeddings, starting right after `<eot>`, set to 0, rounded down as in the official code (paper: 70%; 100% degrades quality) |
 | `--baseline` | off | also make the normal video (same seed) |
 
 Output in `outputs/clip/`: `clip.gif`, plus `baseline.gif` and `baseline_vs_clip.gif` with `--baseline`.
-Only the prompt's embeddings are changed; the empty prompt used for CFG stays normal. Prompts that fill
+As in the official code, `pad` mode pads the empty prompt used for CFG with `!` too (its `v_eot` is kept), because the official code changes the tokenizer's pad token for everything. `mask` mode leaves the empty prompt unchanged. Prompts that fill
 all 77 tokens have no padding, so `mask` then changes nothing (and `pad` only zeroes `v_eot`).
 
 ### 3c. Initial-noise adjustment (`noise`)

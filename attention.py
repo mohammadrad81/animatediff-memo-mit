@@ -61,11 +61,12 @@ class Controller:
     def __init__(self, num_streams, record=False, guard_layers=(), tau=3.0, alpha=0.3,
                  soft_layers=(), temperature=1.0, keep_sot=False, clip_mode=None, mask_eot=True, mask_ratio=0.7,
                  noise_mode=None, rho=50.0, gamma=0.7, adj_iters=2, lr=0.01, target=0.25, max_iters=100,
-                 cfg_start=None):
+                 cfg_start=None, ortho=False):
         self.num_streams = num_streams          # 2 = CFG, 3 = GUARD (or soften with repulsion)
         self.record = record                    # store attention maps of stream 1
         self.guard_layers = set(guard_layers)   # cross-attn layers where GUARD attenuates spikes
         self.tau, self.alpha = tau, alpha       # spike threshold and logit scaling factor
+        self.ortho = ortho                      # GUARD: official code's projection of the attraction direction
         self.soft_layers = set(soft_layers)     # layers (any kind) whose attention is softened
         self.temperature = temperature          # logits are divided by it (> 1 = softer, < 1 = sharper)
         self.keep_sot = keep_sot                # cross-attn: keep the mass on <sot>, soften tokens 1..76 only

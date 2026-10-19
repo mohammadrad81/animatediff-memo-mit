@@ -31,6 +31,9 @@ def guard_args(p, r_flag="--r"):
     p.add_argument("--alpha", type=float, default=0.3, help="spiky logits are multiplied by alpha (1 = no attenuation)")
     p.add_argument("--tau", type=float, default=0.1, help="spike threshold on the z-score")
     p.add_argument("--blocks", default="down,mid", help="UNet parts whose cross-attention is attenuated: down,mid,up")
+    p.add_argument("--ortho", action="store_true",
+                   help="as the official code runs: remove the repulsion direction from the attraction direction "
+                        "where they are almost parallel (cosine > 0.9); off = the paper's equation")
 
 
 def soften_args(p, r_flag="--r"):
@@ -94,7 +97,8 @@ def experiment(name, args, unet, soft_layers=()):
         return Controller(num_streams=2), 0.0
     if name == "guard":
         layers = cross_layers(unet, args.blocks.split(","))
-        return Controller(num_streams=3, guard_layers=layers, tau=args.tau, alpha=args.alpha), args.guard_r
+        return Controller(num_streams=3, guard_layers=layers, tau=args.tau, alpha=args.alpha,
+                          ortho=args.ortho), args.guard_r
     if name == "noise":  # only the initial noise changes (and CFG may start later)
         return noise_controller(args), 0.0
     if name == "clip":  # only the prompt's text embeddings change; normal attention and CFG

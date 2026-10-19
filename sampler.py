@@ -25,7 +25,7 @@ def load_pipeline(device="cuda", dtype=torch.float16):
 
 
 @torch.no_grad()
-def embed_prompts(pipe, prompts, ctrl=None):
+def embed_prompts(pipe, prompts, ctrl=None, null=False):
     """CLIP text embeddings [prompts, 77, 768]. With ctrl.clip_mode set, the CLIP-embedding mitigation of Kim & No
     ("Memorization in Stable Diffusion is unexpectedly driven by CLIP embeddings") is applied:
       [v_sot, v_pr_1..v_pr_n, v_eot, v_pad_1..v_pad_d]   normal: every <pad> is another <eot> token, so the
@@ -33,7 +33,9 @@ def embed_prompts(pipe, prompts, ctrl=None):
       "pad":  the prompt is padded with the "!" token instead of <eot> (v_pad no longer copy v_eot),
               and v_eot is set to 0 (unless ctrl.mask_eot is False)
       "mask": normal padding, but the first mask_ratio (default 70%) of the v_pad, the ones right after <eot>,
-              are set to 0"""
+              are set to 0
+    null=True is the empty prompt used for CFG. As in the official code (which changes the tokenizer's pad token),
+    "pad" also pads it with "!", but its v_eot is kept; "mask" leaves it unchanged."""
     tok, L = pipe.tokenizer, pipe.tokenizer.model_max_length
     mode = ctrl.clip_mode if ctrl is not None else None
     if mode == "pad":
@@ -45,12 +47,27 @@ def embed_prompts(pipe, prompts, ctrl=None):
     emb = pipe.text_encoder(ids.to(pipe.device))[0].clone()
     for i, row in enumerate(ids.tolist()):
         eot = row.index(tok.eos_token_id)  # first <eot> = end of the prompt
+        if null:
+            continue
         if mode == "pad" and ctrl.mask_eot:
             emb[i, eot] = 0
         elif mode == "mask":
             d = L - 1 - eot                          # number of padding embeddings
-            emb[i, eot + 1:eot + 1 + round(ctrl.mask_ratio * d)] = 0
+            emb[i, eot + 1:eot + 1 + int(ctrl.mask_ratio * d)] = 0  # int(): rounded down, as in the official code
     return emb
+
+
+def orthogonalize(v_plus, v_minus, cos_threshold=0.9, coef_clip=2.0, eps=1e-8):
+    """Official GUARD code (dual_guidance_call, orthogonalize_neighbors): where the attraction direction
+    v_plus = eps_plus - eps_null points almost the same way as the repulsion direction v_minus = eps_minus - eps_null
+    (cosine > 0.9), its component along v_minus is removed: v_plus - clip(<v_plus, v_minus> / |v_minus|^2) * v_minus.
+    Done per image in the official code, so here per frame."""
+    a, b = v_plus.float().transpose(1, 2), v_minus.float().transpose(1, 2)  # [videos, frames, 4, h, w]
+    dot = (a * b).flatten(2).sum(-1)
+    b2 = (b * b).flatten(2).sum(-1) + eps
+    cos = dot / (((a * a).flatten(2).sum(-1) + eps).sqrt() * b2.sqrt())
+    coef = (dot / b2).clamp(-coef_clip, coef_clip) * (cos > cos_threshold)
+    return (a - coef[..., None, None, None] * b).transpose(1, 2).to(v_plus.dtype)
 
 
 def frame_norm(d):
@@ -150,12 +167,14 @@ def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=
       eps_plus  : prompt, with cross-attention spikes attenuated (done by the attention processors)
       eps_minus : prompt, normal attention (the possibly memorized direction we are pushed away from)
       r_t       : r * cos(pi/2 * i/steps) with the "cosine" schedule (official code), or r ("constant")
+      ctrl.ortho: (eps_plus - eps_null) is first orthogonalized against (eps_minus - eps_null) where they are
+                  almost parallel, as the official code does (see orthogonalize)
     """
     device, dtype = pipe.device, pipe.unet.dtype
 
     prompts = [prompt] if isinstance(prompt, str) else list(prompt)
     e_prompt = embed_prompts(pipe, prompts, ctrl)       # [videos, 77, 768]
-    e_null = embed_prompts(pipe, [""]).expand_as(e_prompt)  # the empty prompt is never changed
+    e_null = embed_prompts(pipe, [""], ctrl, null=True).expand_as(e_prompt)
     # Positive and negative streams use the same prompt; only the attention inside the UNet differs.
     # Rows are ordered stream, video, frame, so each stream is still one contiguous block for the processors.
     streams = [e_null, e_prompt, e_prompt] if ctrl.num_streams == 3 else [e_null, e_prompt]
@@ -174,7 +193,10 @@ def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=
         if len(streams) == 3:
             eps_null, eps_plus, eps_minus = eps
             r_t = r * math.cos(math.pi / 2 * i / steps) if r_schedule == "cosine" else r
-            noise = eps_null + s * (eps_plus - eps_null) - r_t * (eps_minus - eps_null)
+            v_plus = eps_plus - eps_null
+            if ctrl.ortho:
+                v_plus = orthogonalize(v_plus, eps_minus - eps_null)
+            noise = eps_null + s * v_plus - r_t * (eps_minus - eps_null)
         else:
             eps_null, eps_cond = eps
             noise = eps_null + s * (eps_cond - eps_null)
