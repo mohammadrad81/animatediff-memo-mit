@@ -1,85 +1,35 @@
-# GUARD for AnimateDiff
+# Memorization mitigation for AnimateDiff
 
-This project applies **CA-in-GUARD** to the text-to-video model AnimateDiff. CA-in-GUARD is the
-memorization-mitigation method from *"You Don't Need All That Attention: Surgical Memorization
-Mitigation in Text-to-Image Diffusion Models"* (Zhao et al., ICML 2026,
-[code](https://github.com/kairanzhao/GUARD)). The project also plots every attention map of the
-model and marks the "spiky" ones. A third experiment, `soften`, tests a simpler alternative to GUARD:
-instead of detecting spiky tokens and attenuating only those, it softens all the attention of chosen
-layers with a temperature.
+A test bench for exploring **memorization mitigation in a text-to-video model**. AnimateDiff reuses the
+frozen Stable Diffusion v1.4 image UNet, which is known to reproduce some of its LAION training images,
+and adds motion modules trained on video. This project lets you:
 
-- Model: `CompVis/stable-diffusion-v1-4` + motion adapter `guoyww/animatediff-motion-adapter-v1-4`
-- Four commands:
-  - `attention` generates a video, then plots spatial, cross- and temporal attention for every layer, head, frame and diffusion step, with spikes marked.
-  - `guard` generates a video with GUARD (and, optionally, the normal video for comparison).
-  - `soften` generates a video with temperature-softened attention in the layers you choose (and, optionally, the normal video).
-  - `clip` generates a video with the CLIP-embedding mitigation of Kim & No (padding / `<eot>` embeddings changed).
-  - `noise` generates a video from adjusted initial noise (Han et al.: batch-wise or per-sample).
-  - `batch` runs any of these experiments (normal, GUARD, soften, clip, noise) on every prompt of a CSV sheet and saves the GIFs.
+- **see** what the model does: every attention map (spatial, cross, temporal) for every layer, head,
+  frame and step, with "spiky" attention marked (`attention`);
+- **compare** memorized and normal prompts with signals from the literature (`compare`);
+- **try mitigation methods** adapted from text-to-image papers, plus our own idea, one command each;
+- **run them all on a sheet of prompts** to compare them on equal terms (`batch`).
 
-## The method in short
+Model: `CompVis/stable-diffusion-v1-4` + motion adapter `guoyww/animatediff-motion-adapter-v1-4`.
 
-**1. Spike detector.** In a cross-attention layer, every pixel of a frame (query `q`) attends to the
-77 text tokens (keys `i`). For each token:
+## Experiments at a glance
 
-```
-M_i = max_q  logit[q, i]                  logit = Q K^T / sqrt(d)  (before the softmax)
-Z_i = (M_i - mean(M)) / std(M)            mean/std over tokens 1..76 (token 0 = <sot> is skipped)
-token i is a spike  <=>  Z_i > tau
-```
+| command | method | source | what it changes | cost vs. normal |
+|---|---|---|---|---|
+| (`normal` in `batch`) | plain AnimateDiff, CFG | — | nothing (the baseline) | 1× |
+| `guard` | CA-in-GUARD: attenuate spiky cross-attention tokens, then attract to that prediction and repel from the normal one | Zhao et al., ICML 2026 ([code](https://github.com/kairanzhao/GUARD)) | cross-attention (down + mid) of the prompt stream; guidance | ~1.5× (3 streams) |
+| `soften` | divide the attention logits of chosen layers by a temperature (no spike detection) | our idea, a simpler alternative to GUARD | attention of any layers you choose | 1× (1.5× with `--r`) |
+| `clip` | pad the prompt with `!` instead of `<eot>` and zero `v_eot`, or mask part of the padding embeddings | Kim & No, CVPR 2026 Findings ([code](https://github.com/quasar529/sd-clip-mem)) | the prompt's text embeddings | 1× |
+| `noise` | adjust the initial noise so the prompt pulls weakly at the start (per-sample or batch-wise) | Han et al., NeurIPS 2025 ([code](https://github.com/hygnhan/init_noise_diffusion_memorization)) | the initial noise (and when CFG starts) | +~2 min per video (per-sample) |
 
-This is computed separately for every frame, every head, every layer and every diffusion step, so the
-spiky tokens are found on the fly for each prompt.
+Commands:
+- `attention` generates a video and plots spatial, cross- and temporal attention for every layer, head, frame and diffusion step, with spikes marked. It also saves the memorization signals.
+- `guard`, `soften`, `clip` and `noise` each generate a video with one method, and with `--baseline` also the normal video (same seed) side by side.
+- `batch` runs any of the experiments on every prompt of a CSV sheet and saves the GIFs.
+- `compare` overlays the memorization signals of several `attention` runs.
 
-**2. Attenuation.** Before the softmax, spiky logits are multiplied by `alpha` (e.g. 0.3).
-This is done only in the cross-attention layers of the `down` and `mid` UNet blocks (the official
-code's `BLOCKS_EARLY`). The paper shows that memorization concentrates there and that touching the
-`up` blocks hurts quality.
-
-**3. GUARD guidance.** At every step the UNet is run on a batch of 3 "streams":
-
-| stream | text | attention | gives |
-|---|---|---|---|
-| uncond | `""` | normal | `eps_null` |
-| positive | prompt | spikes attenuated | `eps_plus` |
-| negative | prompt | normal | `eps_minus` (the possibly memorized direction) |
-
-```
-eps = eps_null + s * (eps_plus - eps_null) - r_t * (eps_minus - eps_null)
-```
-
-This `eps` is given to the DDIM scheduler to compute the next latent. `s` attracts the sample towards
-the attenuated prompt and `r` repels it from the normal (memorized) prediction. With `r = 0` you get
-the paper's "CA attenuation" method alone. With `alpha = 1, r = 0` you get normal AnimateDiff.
-
-### Paper vs. official code
-
-Where they differ, this project follows the **official code**:
-
-| | paper text | official code (used here) |
-|---|---|---|
-| `M_i` is computed from | attention probabilities | pre-softmax logits |
-| maps used for detection | the negative (normal) pass | the positive stream's own logits |
-| `tau` | "e.g. 3" | 0.1 for CA-in-GUARD (0.01 for CA attenuation alone) |
-| repulsion | constant `r` | `r_t = r * cos(pi/2 * step/steps)`, decays to 0 (`--r-schedule constant` for the paper's version) |
-| attraction direction | `ε⁺ − ε∅` as is | projected off `ε⁻ − ε∅` wherever their cosine is > 0.9 (see below; **not** followed here by default, `--ortho` to enable) |
-
-**About `--ortho`.** In the official `inference_mem.py`, the argument that would switch this projection off
-(`orthogonalize_neighbors=current_ortho`, set to `False` with the comment "Ortho not needed") is commented out.
-`dual_guidance_call` therefore uses its default `True`. The paper's equation has no projection, so it is off here
-by default. Measured on AnimateDiff:
-- **Memorized prompt (punisher):** the cosine is 0.05–0.84, never above 0.9, so `--ortho` changes nothing.
-- **Normal prompt (cat):** the cosine is above 0.9 for most of the steps, and the projection removes 54–86% of the
-  attraction direction, so the guidance becomes mostly repulsion from the prompt.
-
-### How it is adapted to AnimateDiff
-
-- AnimateDiff runs the SD UNet on every frame, so in spatial and cross attention each frame is one
-  batch row. Spikes are therefore detected and attenuated **per frame and per head**, in exactly the
-  same way the official code works per image and per head.
-- AnimateDiff adds **temporal attention** (motion modules), in which each pixel location attends to
-  the same location in all 16 frames. GUARD does not modify it. The `attention` command plots it and
-  marks spiky *key frames* with the same z-score rule.
+Each method's section below explains it, how it was adapted from images to video, and where the code
+deliberately differs from the paper.
 
 ## Install
 
@@ -95,7 +45,7 @@ first time you run.
 
 ## Usage
 
-Options shared by both commands:
+Options shared by all generating commands:
 
 | option | default | meaning |
 |---|---|---|
@@ -127,7 +77,7 @@ Output in `outputs/attention/`:
 
 ```
 video.gif                    the generated video
-memorization_signals.png     signals that separate memorized from normal prompts (see section 5)
+memorization_signals.png     signals that separate memorized from normal prompts (see section 7)
 memorization_signals.json    the same numbers, for `compare`
 cross_summary.png            like Fig. 1 of the paper: attention per token in the first and last step,
                              and the attention on <eot> over the steps
@@ -193,7 +143,73 @@ Plotting is the slow part: 72 figures per step, saved at `dpi=200` (set in `save
 lower it for faster, smaller images). That is about a minute per step, so use `--plot-steps` to look at
 a few steps first.
 
-### 2. Generate a video with GUARD
+### 2. GUARD (`guard`)
+
+#### How GUARD works
+
+**1. Spike detector.** In a cross-attention layer, every pixel of a frame (query `q`) attends to the
+77 text tokens (keys `i`). For each token:
+
+```
+M_i = max_q  logit[q, i]                  logit = Q K^T / sqrt(d)  (before the softmax)
+Z_i = (M_i - mean(M)) / std(M)            mean/std over tokens 1..76 (token 0 = <sot> is skipped)
+token i is a spike  <=>  Z_i > tau
+```
+
+This is computed separately for every frame, every head, every layer and every diffusion step, so the
+spiky tokens are found on the fly for each prompt.
+
+**2. Attenuation.** Before the softmax, spiky logits are multiplied by `alpha` (e.g. 0.3).
+This is done only in the cross-attention layers of the `down` and `mid` UNet blocks (the official
+code's `BLOCKS_EARLY`). The paper shows that memorization concentrates there and that touching the
+`up` blocks hurts quality.
+
+**3. GUARD guidance.** At every step the UNet is run on a batch of 3 "streams":
+
+| stream | text | attention | gives |
+|---|---|---|---|
+| uncond | `""` | normal | `eps_null` |
+| positive | prompt | spikes attenuated | `eps_plus` |
+| negative | prompt | normal | `eps_minus` (the possibly memorized direction) |
+
+```
+eps = eps_null + s * (eps_plus - eps_null) - r_t * (eps_minus - eps_null)
+```
+
+This `eps` is given to the DDIM scheduler to compute the next latent. `s` attracts the sample towards
+the attenuated prompt and `r` repels it from the normal (memorized) prediction. With `r = 0` you get
+the paper's "CA attenuation" method alone. With `alpha = 1, r = 0` you get normal AnimateDiff.
+
+#### Paper vs. official code
+
+Where they differ, this project follows the **official code**:
+
+| | paper text | official code (used here) |
+|---|---|---|
+| `M_i` is computed from | attention probabilities | pre-softmax logits |
+| maps used for detection | the negative (normal) pass | the positive stream's own logits |
+| `tau` | "e.g. 3" | 0.1 for CA-in-GUARD (0.01 for CA attenuation alone) |
+| repulsion | constant `r` | `r_t = r * cos(pi/2 * step/steps)`, decays to 0 (`--r-schedule constant` for the paper's version) |
+| attraction direction | `ε⁺ − ε∅` as is | projected off `ε⁻ − ε∅` wherever their cosine is > 0.9 (see below; **not** followed here by default, `--ortho` to enable) |
+
+**About `--ortho`.** In the official `inference_mem.py`, the argument that would switch this projection off
+(`orthogonalize_neighbors=current_ortho`, set to `False` with the comment "Ortho not needed") is commented out.
+`dual_guidance_call` therefore uses its default `True`. The paper's equation has no projection, so it is off here
+by default. Measured on AnimateDiff:
+- **Memorized prompt (punisher):** the cosine is 0.05–0.84, never above 0.9, so `--ortho` changes nothing.
+- **Normal prompt (cat):** the cosine is above 0.9 for most of the steps, and the projection removes 54–86% of the
+  attraction direction, so the guidance becomes mostly repulsion from the prompt.
+
+#### How it is adapted to AnimateDiff
+
+- AnimateDiff runs the SD UNet on every frame, so in spatial and cross attention each frame is one
+  batch row. Spikes are therefore detected and attenuated **per frame and per head**, in exactly the
+  same way the official code works per image and per head.
+- AnimateDiff adds **temporal attention** (motion modules), in which each pixel location attends to
+  the same location in all 16 frames. GUARD does not modify it. The `attention` command plots it and
+  marks spiky *key frames* with the same z-score rule.
+
+#### Usage
 
 ```bash
 python main.py guard --prompt "Living in the Light with Ann Graham Lotz" --baseline
@@ -214,7 +230,7 @@ Output in `outputs/guard/`:
 | `--r` | 2.0 | repulsion scale (0 = CA attenuation only) |
 | `--r-schedule` | `cosine` | `cosine`: `r` decays to 0 (official code); `constant`: paper Eq. 5 |
 | `--alpha` | 0.3 | spiky logits are multiplied by this (1 = no attenuation) |
-| `--tau` | 3.0 | spike threshold on the z-score |
+| `--tau` | 0.1 | spike threshold on the z-score |
 | `--blocks` | `down,mid` | UNet parts whose cross-attention is attenuated (`down`, `mid`, `up`) |
 | `--ortho` | off | do what the official code actually runs: where `ε⁺ − ε∅` and `ε⁻ − ε∅` have cosine > 0.9 (per frame), remove the `ε⁻ − ε∅` component from the attraction (coefficient clipped to ±2) |
 | `--baseline` | off | also make the normal video |
@@ -222,7 +238,7 @@ Output in `outputs/guard/`:
 The defaults are the official repo's CA-in-GUARD settings for SD v1.4. The paper's search ranges
 (their Table 2) were `tau` 0.1–3, `alpha` 0.1–0.9 and `r` 0.1–6.
 
-### 3. Soften attention with a temperature
+### 3. Soften attention with a temperature (`soften`)
 
 GUARD finds the spiky tokens and scales only their logits by `alpha`. This experiment asks whether that
 targeting is needed: in the chosen layers, **all** logits are divided by a temperature `T` before the
@@ -317,7 +333,7 @@ no statistics are computed for them.
 `soften` (cross-attention of `down,mid`, `--r 0`) touches the same layers as `python main.py guard
 --r 0`, the paper's "CA attenuation" alone. Add `--r 2` to both to compare with full CA-in-GUARD.
 
-### 3b. CLIP-embedding mitigation (`clip`)
+### 4. CLIP-embedding mitigation (`clip`)
 
 From *"Memorization in Stable Diffusion Is Unexpectedly Driven by CLIP Embeddings"* (Kim & No, 2026,
 [code](https://github.com/quasar529/sd-clip-mem)). SD v1.4's tokenizer pads every prompt to 77 tokens by
@@ -350,7 +366,7 @@ Output in `outputs/clip/`: `clip.gif`, plus `baseline.gif` and `baseline_vs_clip
 As in the official code, `pad` mode pads the empty prompt used for CFG with `!` too (its `v_eot` is kept), because the official code changes the tokenizer's pad token for everything. `mask` mode leaves the empty prompt unchanged. Prompts that fill
 all 77 tokens have no padding, so `mask` then changes nothing (and `pad` only zeroes `v_eot`).
 
-### 3c. Initial-noise adjustment (`noise`)
+### 5. Initial-noise adjustment (`noise`)
 
 From *"Adjusting Initial Noise to Mitigate Memorization in Text-to-Image Diffusion Models"* (Han et al.,
 NeurIPS 2025, [code](https://github.com/hygnhan/init_noise_diffusion_memorization)).
@@ -411,7 +427,7 @@ Output in `outputs/noise/`:
   image. Per-sample produced a different composition that still matches the prompt. Batch-wise drifted
   to an abstract texture: the unconditional first steps cost prompt alignment, as the paper warns.
 
-### 4. Run the experiments on a CSV sheet of prompts
+### 6. Run the experiments on a CSV sheet of prompts (`batch`)
 
 The sheet must have a column `caption` (the prompt) and a column `index` (used as the file name). Other
 columns are ignored, and rows with an empty caption are skipped.
@@ -491,7 +507,7 @@ with the batch size and the denoising loop amplifies it (mean pixel difference �
 Run time is about 33 s per video for normal and 49 s for GUARD (or soften with `--soften-r`), so the
 three experiments together take about 2 minutes per prompt at the default settings.
 
-### 5. Compare memorized and non-memorized prompts
+### 7. Compare memorized and non-memorized prompts (`compare`)
 
 The spike plots do **not** tell a memorized prompt from a normal one. The z-score flags tokens that stand
 out *within* a prompt, so every prompt has spikes. GUARD uses them only to choose *which* tokens to
@@ -526,7 +542,7 @@ attention is a sum over tokens, and it is only meaningful as an average over the
 | `main.py` | command line (`attention`, `guard`, `soften`, `clip`, `noise`, `batch`, `compare`); `experiment()` builds the normal / guard / soften / clip / noise setup that all commands share |
 | `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams); `embed_prompts` builds the text embeddings, including the `clip` mitigation; `adjust_noise` is the `noise` experiment |
 | `attention.py` | the attention processor put in every layer: `spike_scores` / `find_spikes` (detector), `Processor.attenuated` (GUARD), `Processor.softened` (temperature), `Processor.recorded` (stores maps for plots), `select_layers` (layer choice for `soften`) |
-| `plots.py` | all figures and the text summaries; `memorization_signals` / `plot_memorization_signals` for section 5 |
+| `plots.py` | all figures and the text summaries; `memorization_signals` / `plot_memorization_signals` for section 7 |
 
 ## Notes
 

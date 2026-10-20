@@ -1,4 +1,5 @@
-"""Load AnimateDiff and run the denoising loop (normal CFG or GUARD)."""
+"""Load AnimateDiff and run the denoising loop: normal CFG, or with one of the mitigation experiments
+(GUARD / soften with repulsion as 3 streams, CLIP-embedding changes, adjusted initial noise)."""
 import contextlib
 import functools
 import math

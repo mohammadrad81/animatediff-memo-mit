@@ -288,7 +288,7 @@ def run_batch(args, pipe):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GUARD memorization mitigation and attention plots for AnimateDiff")
+    parser = argparse.ArgumentParser(description="Exploring memorization mitigation for AnimateDiff: attention plots, memorization signals and mitigation experiments (GUARD, soften, CLIP embeddings, initial noise)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     a = sub.add_parser("attention", help="generate a video (normal CFG), plot all attention maps and mark spikes")

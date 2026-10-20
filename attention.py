@@ -1,13 +1,15 @@
 """Custom attention processor for the AnimateDiff UNet.
 
 It replaces diffusers' attention in every layer and can
-  1. record attention maps of the prompt-conditioned stream (for plotting),
-  2. apply GUARD's cross-attention attenuation to the "positive" stream, or
+  1. record attention maps of the prompt-conditioned stream (for plotting and memorization signals),
+  2. apply GUARD's cross-attention attenuation to the "positive" stream (the `guard` experiment), or
   3. soften the attention of chosen layers of that stream with a temperature (the `soften` experiment).
+Controller also carries the settings of the experiments that act outside attention (`clip`, `noise`);
+those are applied in sampler.py.
 
 The UNet batch is made of "streams", each with one row per frame:
   2 streams: [uncond, cond]                 (normal classifier-free guidance)
-  3 streams: [uncond, positive, negative]   (GUARD)
+  3 streams: [uncond, positive, negative]   (GUARD, or soften with repulsion)
 Stream 1 (rows n:2n) is the one we record / attenuate / soften.
 
 Inside the UNet there are three kinds of attention layers:
