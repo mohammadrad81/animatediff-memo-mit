@@ -283,7 +283,8 @@ def memorization_signals(ctrl, frames, prompt):
     """The numbers used to compare memorized and non-memorized prompts, as a JSON-friendly dict.
     guidance:    [steps][frames] ||eps_cond - eps_null|| (Wen et al.: large for memorized prompts)
     eot_share:   block -> [steps] share of cross-attention on <eot> + padding tokens, mean over the layers of the
-                 block, frames, heads and query pixels (Ren et al. / GUARD Fig. 7: stays high when memorized)
+                 block, frames, heads and query pixels (our extension of Kim & No, CVPR 2026 Findings, and
+                 Chen et al., ICLR 2025, who link the <eot> / padding tokens to memorization)
     frame_change:     [frames-1] mean |pixel difference| between consecutive frames (pixels in 0..1)
     frame_similarity: [frames] cosine similarity of every frame to frame 0"""
     eot = {}
