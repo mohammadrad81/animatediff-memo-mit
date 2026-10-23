@@ -84,6 +84,24 @@ def guidance_eps(pipe, x, t, e_null, e_prompt):
     return (eps_cond - eps_null).float()
 
 
+def per_frame(n):
+    """[videos, frames] -> broadcastable against [videos, 4, frames, h, w]."""
+    return n[:, None, :, None, None]
+
+
+def guidance_vjp(pipe, x, t, e_null, e_prompt, v):
+    """J^T v, with J the Jacobian of eps~(x) = eps_cond - eps_null w.r.t. the latent x (one video, float32).
+    The two streams are backpropagated one after the other and the UNet blocks are recomputed instead of
+    stored (checkpointed_blocks): a single 2-stream backward pass of 16 frames does not fit in 16 GB."""
+    x = x.detach().requires_grad_(True)
+    with torch.enable_grad(), checkpointed_blocks(pipe.unet):
+        for e, sign in [(e_prompt, 1.0), (e_null, -1.0)]:
+            xin = pipe.scheduler.scale_model_input(x.to(pipe.unet.dtype), t)
+            out = pipe.unet(xin, t, encoder_hidden_states=e.repeat_interleave(x.shape[2], dim=0)).sample
+            out.float().backward(sign * v)
+    return x.grad
+
+
 @contextlib.contextmanager
 def checkpointed_blocks(unet):
     """Recompute every UNet block in the backward pass instead of storing its activations. Without this, the
@@ -119,7 +137,6 @@ def adjust_noise(pipe, x, t, e_null, e_prompt, ctrl):
             delta = ctrl.rho * d / frame_norm(d)[:, None, :, None, None]
             x = x - ctrl.gamma * (guidance_eps(pipe, x + delta, t, e_null, e_prompt) - d)
     else:
-        frames = x.shape[2]
         videos = []
         for v in range(x.shape[0]):
             lat = x[v:v + 1].clone().requires_grad_(True)
@@ -132,15 +149,8 @@ def adjust_noise(pipe, x, t, e_null, e_prompt, ctrl):
                 pbar.set_postfix(max_norm=f"{n.max():.3f}", target=ctrl.target)
                 if n.max() <= ctrl.target:
                     break
-                # Gradient of sum_f ||eps_cond - eps_null|| = J_cond^T g - J_null^T g with g = eps~ / ||eps~||.
-                # Computing the two streams one after the other halves the memory of one backward pass.
-                g = d / n[:, None, :, None, None]
-                optim.zero_grad()
-                with torch.enable_grad(), checkpointed_blocks(pipe.unet):
-                    for e, sign in [(ep, 1.0), (en, -1.0)]:
-                        xin = pipe.scheduler.scale_model_input(lat.to(pipe.unet.dtype), t)
-                        out = pipe.unet(xin, t, encoder_hidden_states=e.repeat_interleave(frames, dim=0)).sample
-                        out.float().backward(sign * g)
+                optim.zero_grad()  # gradient of sum_f ||eps~_f|| is J^T (eps~ / ||eps~||), per frame
+                lat.grad = guidance_vjp(pipe, lat, t, en, ep, d / per_frame(n))
                 optim.step()
             else:
                 steps[v] = ctrl.max_iters
@@ -152,6 +162,62 @@ def adjust_noise(pipe, x, t, e_null, e_prompt, ctrl):
         print(f"initial noise adjusted ({ctrl.noise_mode}): max over frames of ||eps_cond - eps_null|| "
               f"{before[v].max():.3f} -> {after[v].max():.3f}" + (f" in {steps[v]} steps" if ctrl.noise_mode == "sample" else ""))
     return x.to(pipe.unet.dtype)
+
+
+def sail(pipe, x, t, e_null, e_prompt, ctrl, seed):
+    """SAIL (Jeon, Kim & No, ICML 2025): choose an initial noise x_T where the conditional density is not sharp.
+    Sharpness ||H~ s~|| is approximated by a finite difference along the guidance direction; as in the official
+    code (local_model/pipe.py), per frame here (each frame is like one SD image):
+        loss_f = || eps~(x + d_f) ||_f + alpha * ||x_f||        d_f = eps~(x)_f / ||eps~(x)_f||   (unit step)
+    x is optimized with Adam (lr 0.05) for at most sail_steps steps, until every frame has loss_f <= sail_thres.
+    If that fails, a new noise (seed + 1, + 2, ...) is tried, at most sail_rounds times (the official code also
+    restarts with new seeds); the noise with the lowest loss is kept. Round 0 starts from the normal noise.
+    sail_thres None: alpha * sqrt(latent size of a frame) + 0.2, i.e. the Gaussian term of N(0, I) noise plus a
+    sharpness term of 0.2 (6.6 at 512x512); a fixed number would depend on the resolution."""
+    thres = ctrl.sail_thres
+    if thres is None:
+        thres = ctrl.sail_alpha * (x[:, :, 0].numel() / x.shape[0]) ** 0.5 + 0.2
+    videos = []
+    for v in range(x.shape[0]):
+        en, ep = e_null[v:v + 1], e_prompt[v:v + 1]
+        eps = lambda z: guidance_eps(pipe, z, t, en, ep)
+        best = None  # (max loss over frames, latent, round, steps, per-frame loss, sharpness, |x|)
+        first = None  # sharpness term per frame of the normal noise, before any step
+        for r in range(ctrl.sail_rounds):
+            start = x[v:v + 1] if r == 0 else torch.randn(x[v:v + 1].shape, device=x.device,
+                                                          generator=torch.Generator(x.device).manual_seed(seed + r))
+            lat = start.float().clone().requires_grad_(True)
+            optim = torch.optim.Adam([lat], lr=ctrl.sail_lr)
+            for step in range(ctrl.sail_steps + 1):
+                z = lat.detach()
+                d = eps(z)
+                n = frame_norm(d)
+                y = z + d / per_frame(n)                       # one unit step along the guidance direction
+                dy = eps(y)
+                ny = frame_norm(dy)
+                loss = ny + ctrl.sail_alpha * frame_norm(z)    # [1, frames]
+                first = ny[0].tolist() if first is None else first
+                if best is None or loss.max() < best[0]:
+                    best = (loss.max().item(), z.clone(), r, step, loss[0].tolist(), ny[0].tolist(), frame_norm(z)[0].tolist())
+                if loss.max() <= thres or step == ctrl.sail_steps:
+                    break
+                # Exact gradient of sum_f loss_f. Through y: u = J(y)^T dy/|dy|. Through the direction
+                # d/|d|: J(z)^T w, with w = (u - d^ <d^, u>) / |d| per frame. Gaussian term: alpha * z / |z|.
+                u = guidance_vjp(pipe, y, t, en, ep, dy / per_frame(ny))
+                dh = d / per_frame(n)
+                w = (u - dh * per_frame((dh * u).transpose(1, 2).flatten(2).sum(-1))) / per_frame(n)
+                optim.zero_grad()
+                lat.grad = u + guidance_vjp(pipe, z, t, en, ep, w) + ctrl.sail_alpha * z / per_frame(frame_norm(z))
+                optim.step()
+            print(f"SAIL round {r} (seed {seed + r}): max loss over frames {loss.max():.3f} after {step} steps "
+                  f"(threshold {thres:.2f})")
+            if loss.max() <= thres:
+                break
+        ctrl.sail_log.append({"loss": best[0], "threshold": thres, "round": best[2], "seed": seed + best[2],
+                              "steps": best[3], "reached": best[0] <= thres, "frame_loss": best[4],
+                              "frame_sharpness_before": first, "frame_sharpness": best[5], "frame_x_norm": best[6]})
+        videos.append(best[1])
+    return torch.cat(videos).to(pipe.unet.dtype)
 
 
 @torch.no_grad()
@@ -185,7 +251,9 @@ def sample(pipe, prompt, ctrl, frames=16, steps=25, height=512, width=512, seed=
     latents = torch.cat([torch.randn((1, 4, frames, height // 8, width // 8), generator=torch.Generator(device).manual_seed(seed),
                                      device=device, dtype=dtype) for _ in prompts])
     latents = latents * pipe.scheduler.init_noise_sigma
-    if ctrl.noise_mode:  # initial-noise adjustment (Han et al.)
+    if ctrl.sail:  # SAIL: sharpness-aware initial noise (Jeon et al.)
+        latents = sail(pipe, latents, pipe.scheduler.timesteps[0], e_null, e_prompt, ctrl, seed)
+    elif ctrl.noise_mode:  # initial-noise adjustment (Han et al.)
         latents = adjust_noise(pipe, latents, pipe.scheduler.timesteps[0], e_null, e_prompt, ctrl)
 
     for i, t in enumerate(tqdm(pipe.scheduler.timesteps, desc="denoising")):

@@ -21,10 +21,11 @@ Model: `CompVis/stable-diffusion-v1-4` + motion adapter `guoyww/animatediff-moti
 | `soften` | divide the attention logits of chosen layers by a temperature (no spike detection) | our idea, a simpler alternative to GUARD | attention of any layers you choose | 1× (1.5× with `--r`) |
 | `clip` | pad the prompt with `!` instead of `<eot>` and zero `v_eot`, or mask part of the padding embeddings | Kim & No, CVPR 2026 Findings ([code](https://github.com/quasar529/sd-clip-mem)) | the prompt's text embeddings | 1× |
 | `noise` | adjust the initial noise so the prompt pulls weakly at the start (per-sample or batch-wise) | Han et al., NeurIPS 2025 ([code](https://github.com/hygnhan/init_noise_diffusion_memorization)) | the initial noise (and when CFG starts) | +~2 min per video (per-sample) |
+| `sail` | optimize the initial noise towards a less *sharp* conditional density (SAIL) | Jeon, Kim & No, ICML 2025 ([code](https://github.com/Dongjae0324/sharpness_memorization_diffusion)) | the initial noise | +~1–2 min per video |
 
 Commands:
 - `attention` generates a video and plots spatial, cross- and temporal attention for every layer, head, frame and diffusion step, with spikes marked. It also saves the memorization signals.
-- `guard`, `soften`, `clip` and `noise` each generate a video with one method, and with `--baseline` also the normal video (same seed) side by side.
+- `guard`, `soften`, `clip`, `noise` and `sail` each generate a video with one method, and with `--baseline` also the normal video (same seed) side by side.
 - `batch` runs any of the experiments on every prompt of a CSV sheet and saves the GIFs.
 - `compare` overlays the memorization signals of several `attention` runs.
 
@@ -77,7 +78,7 @@ Output in `outputs/attention/`:
 
 ```
 video.gif                    the generated video
-memorization_signals.png     signals that separate memorized from normal prompts (see section 7)
+memorization_signals.png     signals that separate memorized from normal prompts (see section 8)
 memorization_signals.json    the same numbers, for `compare`
 cross_summary.png            like Fig. 1 of the paper: attention per token in the first and last step,
                              and the attention on <eot> over the steps
@@ -427,7 +428,96 @@ Output in `outputs/noise/`:
   image. Per-sample produced a different composition that still matches the prompt. Batch-wise drifted
   to an abstract texture: the unconditional first steps cost prompt alignment, as the paper warns.
 
-### 6. Run the experiments on a CSV sheet of prompts (`batch`)
+### 6. Sharpness-aware initial noise (`sail`)
+
+From *"Understanding and Mitigating Memorization in Generative Models via Sharpness of Probability
+Landscapes"* (Jeon, Kim & No, ICML 2025, [code](https://github.com/Dongjae0324/sharpness_memorization_diffusion)).
+
+**Idea.** A memorized prompt makes the conditional density *sharp*: a narrow peak around the training
+image. Sharpness is the curvature of the log-density, i.e. the eigenvalues of the Hessian `H`. The paper
+measures it with `‖H̃ s̃‖`, where `s̃` is the text guidance (cond − uncond score) and `H̃` the cond − uncond
+Hessian. SAIL (Sharpness-Aware Initialization for Latent diffusion) picks an initial noise `x_T` where this
+is small, then generates normally with full CFG. Prompt, attention and model stay untouched.
+
+**What is computed.** `‖H̃ s̃‖` would need second derivatives, so it is approximated by taking one step along
+the guidance direction and measuring the guidance there. Per frame, as in the official code:
+
+```
+d_f    = ε̃(x)_f / ‖ε̃(x)_f‖                    unit step along the text guidance  (ε̃ = ε_cond − ε_null)
+loss_f = ‖ ε̃(x + d)_f ‖  +  α · ‖x_f‖           sharpness term + Gaussian term (keeps x like N(0, I) noise)
+```
+
+Adam (lr 0.05) on `x` for at most 10 steps, until **every** frame has `loss_f ≤ sail-thres`. If it does
+not get there, a new noise (seed + 1, seed + 2, …) is tried, up to `--sail-rounds`. The noise with the lowest
+loss is kept. Round 0 starts from the normal noise of `--seed`, so if it succeeds the video is the normal
+video's "neighbour".
+
+```bash
+python main.py sail --prompt "As Punisher Joins <i>Daredevil</i> Season Two, Who Will the New Villain Be?" --baseline
+python main.py sail --prompt "..." --sail-thres 6.5 --sail-steps 20        # stronger: lower threshold, more steps
+```
+
+| option | default | meaning |
+|---|---|---|
+| `--sail-thres` | auto | stop when every frame's loss is at most this. Default: `α·√(latent size of a frame) + 0.2`, i.e. 6.6 at 512×512 (3.4 at 256×256); the Gaussian term grows with the resolution |
+| `--sail-lr` | 0.05 | Adam learning rate (official) |
+| `--sail-alpha` | 0.05 | weight of the Gaussian term (official, SD v1) |
+| `--sail-steps` | 10 | Adam steps per noise (official) |
+| `--sail-rounds` | 3 | noises to try |
+| `--baseline` | off | also make the normal video (same seed) |
+
+Output in `outputs/sail/`:
+- `sail.gif`, plus `baseline.gif` and `baseline_vs_sail.gif` with `--baseline`.
+- `sail.json`: the kept noise's round, seed and Adam steps, whether the threshold was reached, and per
+  frame the loss, the sharpness term before and after, and `‖x_f‖`.
+
+**Paper vs. official code** (this project follows the code):
+
+| | paper (Algorithm 2) | official code (used here) |
+|---|---|---|
+| loss | `‖s̃(x + δ s̃) − s̃(x)‖² + α‖x‖²` (scores) | `‖ε̃(x + ε̃/‖ε̃‖)‖ + α‖x‖` (noise predictions, no difference, not squared) |
+| optimizer | gradient step | Adam, lr 0.05, at most 10 steps, then a new seed |
+| candidates | one `x_T` | 8 noises optimized together, the first ones under the threshold are used |
+
+Smaller differences from the official code:
+- **One noise at a time:** 8 videos with gradients do not fit in 16 GB.
+- **Failed rounds:** the official code loops until it succeeds, and every 3 failed rounds raises the
+  threshold by 0.1 and changes the seed. Here the threshold stays fixed; after `--sail-rounds` rounds, the
+  noise with the lowest loss is kept.
+- **The first noise:** the official code draws it from its own seed (42). Here round 0 starts from the normal
+  noise of `--seed`, so the result can be compared with the baseline.
+- **The last Adam step:** the official code never evaluates the result of its 10th Adam step. Here it is
+  evaluated (and kept if it is the best). The
+threshold values in the paper (7.6–9 for SD v1.4) are for the code's loss.
+
+One difference from the official code: it computes the step direction once, from the *starting* noise,
+and reuses it at every Adam step (`lat_single` is built before the loop). Here the direction is recomputed
+at the current `x`, as the paper's algorithm describes. The gradient includes the path through the direction
+(checked against autograd: cosine 0.9999).
+
+**How it is adapted to AnimateDiff**
+- **Per frame.** Each frame's latent has the size of one SD image latent (4×64×64), so the norms, the unit
+  step and `α` keep the paper's meaning. All 16 frames are optimized together, since they interact through
+  the motion modules.
+- **Recalibrated threshold.** For SD v1.4 the Gaussian term is about 6.4 (`0.05·‖x‖`, with `‖x‖ ≈ 128`), so
+  the paper's 8.2 asks for a sharpness term ≤ 1.8. That is the level of normal prompts: we measured 0.4–1.95
+  on normal prompts and up to 5.6–7.2 on memorized ones. In AnimateDiff the sharpness term at the first step is
+  only 0.2–0.67 per frame, and memorized prompts are *not* higher than normal ones (punisher 0.39–0.45, cat
+  0.53–0.67). The same signal appears only later in AnimateDiff (see section 8). 8.2 would therefore stop
+  immediately. The default asks for a sharpness term of about 0.2 on top of the Gaussian term of normal
+  noise (6.6 in total at 512×512).
+- **Memory.** The gradient goes through the UNet twice (at `x` and at `x + d`). The same tricks as in `noise`
+  are used: one stream at a time and recomputed blocks.
+
+**Cost and first results** (512×512, 16 frames, 25 steps):
+- **Speed:** about 11 s per Adam step. Punisher: 3 steps; cat: 6 steps.
+- **What changed:** the sharpness term dropped by 38–50% (punisher 0.39–0.45 → 0.24–0.29). The noise's norm
+  also shrank by about 3% (128 → 122–125), which gives about half of the loss reduction; the Gaussian term
+  `α‖x‖` rewards a smaller norm.
+- **What the video looked like:** the memorized Daredevil figure was gone, but the video became a flat, low-detail
+  red and blue scene. A smaller noise norm tends to give smoother images, so check quality against `noise`.
+
+### 7. Run the experiments on a CSV sheet of prompts (`batch`)
 
 The sheet must have a column `caption` (the prompt) and a column `index` (used as the file name). Other
 columns are ignored, and rows with an empty caption are skipped.
@@ -439,7 +529,7 @@ index,caption
 ```
 
 ```bash
-# all five experiments on the whole sheet
+# all six experiments on the whole sheet
 python main.py batch --csv prompts.csv --out outputs/my_run
 
 # only normal inference and GUARD
@@ -485,13 +575,14 @@ videos made with different settings are never mixed. Use a new `--out` for each 
 |---|---|---|
 | `--csv` | (required) | the sheet, with columns `index` and `caption` |
 | `--out` | `outputs/batch` | output folder |
-| `--experiments` | `normal,guard,soften,clip,noise` | which experiments to run |
+| `--experiments` | `normal,guard,soften,clip,noise,sail` | which experiments to run |
 | `--start`, `--end` | whole sheet | rows to run |
 | `--batch-size` | 1 | prompts generated together in one UNet pass (see below) |
 | `--guard-r`, `--alpha`, `--tau`, `--blocks` | 2.0, 0.3, 0.1, `down,mid` | GUARD settings, as in `guard` (`--guard-r` is `guard`'s `--r`) |
 | `-T`, `--kinds`, `--layers`, `--keep-sot`, `--soften-r` | 2.0, `cross`, `down,mid`, off, 0 | soften settings, as in `soften` (`--soften-r` is `soften`'s `--r`) |
 | `--clip-mode`, `--keep-eot`, `--mask-ratio` | `pad`, off, 0.7 | clip settings, as in `clip` |
 | `--noise-mode`, `--lr`, `--target`, `--max-iters`, `--rho`, `--gamma`, `--adj-iters`, `--cfg-start` | as in `noise` | noise settings, as in `noise` (per-sample adds about 2 min per prompt) |
+| `--sail-thres`, `--sail-lr`, `--sail-alpha`, `--sail-steps`, `--sail-rounds` | as in `sail` | SAIL settings, as in `sail` (adds about 1–2 min per prompt) |
 | `--r-schedule` | `cosine` | schedule of both `--guard-r` and `--soften-r` |
 
 `--frames`, `--steps`, `--height`, `--width`, `--seed`, `--s` and `--fps` are the same as in the other commands.
@@ -507,7 +598,7 @@ with the batch size and the denoising loop amplifies it (mean pixel difference �
 Run time is about 33 s per video for normal and 49 s for GUARD (or soften with `--soften-r`), so the
 three experiments together take about 2 minutes per prompt at the default settings.
 
-### 7. Compare memorized and non-memorized prompts (`compare`)
+### 8. Compare memorized and non-memorized prompts (`compare`)
 
 The spike plots do **not** tell a memorized prompt from a normal one. The z-score flags tokens that stand
 out *within* a prompt, so every prompt has spikes. GUARD uses them only to choose *which* tokens to
@@ -539,10 +630,10 @@ attention is a sum over tokens, and it is only meaningful as an average over the
 
 | file | content |
 |---|---|
-| `main.py` | command line (`attention`, `guard`, `soften`, `clip`, `noise`, `batch`, `compare`); `experiment()` builds the normal / guard / soften / clip / noise setup that all commands share |
-| `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams); `embed_prompts` builds the text embeddings, including the `clip` mitigation; `adjust_noise` is the `noise` experiment |
+| `main.py` | command line (`attention`, `guard`, `soften`, `clip`, `noise`, `sail`, `batch`, `compare`); `experiment()` builds the normal / guard / soften / clip / noise / sail setup that all commands share |
+| `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams); `embed_prompts` builds the text embeddings, including the `clip` mitigation; `adjust_noise` is the `noise` experiment, `sail` the `sail` experiment, `guidance_vjp` the memory-saving gradient both use |
 | `attention.py` | the attention processor put in every layer: `spike_scores` / `find_spikes` (detector), `Processor.attenuated` (GUARD), `Processor.softened` (temperature), `Processor.recorded` (stores maps for plots), `select_layers` (layer choice for `soften`) |
-| `plots.py` | all figures and the text summaries; `memorization_signals` / `plot_memorization_signals` for section 7 |
+| `plots.py` | all figures and the text summaries; `memorization_signals` / `plot_memorization_signals` for section 8 |
 
 ## Notes
 

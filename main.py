@@ -1,4 +1,4 @@
-"""Command line interface. See README.md, or run:  python main.py {attention,guard,soften,clip,noise,batch,compare} --help"""
+"""Command line interface. See README.md, or run:  python main.py {attention,guard,soften,clip,noise,sail,batch,compare} --help"""
 import argparse
 import csv
 import json
@@ -78,6 +78,16 @@ def noise_controller(args):
                       cfg_start=cfg_start)
 
 
+def sail_args(p):
+    p.add_argument("--sail-thres", type=float, default=None,
+                   help="stop when every frame has ||eps~(x + d)|| + alpha*||x|| <= this (default: alpha*sqrt(latent "
+                        "size per frame) + 0.2, i.e. 6.6 at 512x512; paper: 8.2 for SD images, see README)")
+    p.add_argument("--sail-lr", type=float, default=0.05, help="Adam learning rate (official code: 0.05)")
+    p.add_argument("--sail-alpha", type=float, default=0.05, help="weight of the Gaussian term alpha*||x|| (SD v1: 0.05)")
+    p.add_argument("--sail-steps", type=int, default=10, help="Adam steps per initial noise (official code: 10)")
+    p.add_argument("--sail-rounds", type=int, default=3, help="initial noises to try (seed, seed+1, ...)")
+
+
 def schedule_arg(p):
     p.add_argument("--r-schedule", choices=["cosine", "constant"], default="cosine",
                    help="cosine: r decays to 0 over the steps (official GUARD code); constant: fixed r (paper Eq. 5)")
@@ -92,13 +102,16 @@ def soften_layers(args, unet):
 
 
 def experiment(name, args, unet, soft_layers=()):
-    """Controller and repulsion scale r of one experiment: normal (plain AnimateDiff), guard, soften, clip or noise."""
+    """Controller and repulsion scale r of one experiment: normal (plain AnimateDiff), guard, soften, clip, noise or sail."""
     if name == "normal":  # no recording, no attenuation = plain AnimateDiff
         return Controller(num_streams=2), 0.0
     if name == "guard":
         layers = cross_layers(unet, args.blocks.split(","))
         return Controller(num_streams=3, guard_layers=layers, tau=args.tau, alpha=args.alpha,
                           ortho=args.ortho), args.guard_r
+    if name == "sail":  # only the initial noise changes
+        return Controller(num_streams=2, sail=True, sail_thres=args.sail_thres, sail_lr=args.sail_lr,
+                          sail_alpha=args.sail_alpha, sail_steps=args.sail_steps, sail_rounds=args.sail_rounds), 0.0
     if name == "noise":  # only the initial noise changes (and CFG may start later)
         return noise_controller(args), 0.0
     if name == "clip":  # only the prompt's text embeddings change; normal attention and CFG
@@ -169,6 +182,26 @@ def run_noise(args, pipe):
     print(f"done: {args.out}")
 
 
+def run_sail(args, pipe):
+    """SAIL (Jeon et al.), and optionally the plain CFG video (same seed) for comparison."""
+    common = (args.frames, args.steps, args.height, args.width, args.seed, args.s)
+    if args.baseline:
+        plain, _ = experiment("normal", args, pipe.unet)
+        install(pipe.unet, plain)
+        baseline = sample(pipe, args.prompt, plain, *common)
+        save_gif(baseline, os.path.join(args.out, "baseline.gif"), args.fps)
+    ctrl, _ = experiment("sail", args, pipe.unet)
+    install(pipe.unet, ctrl)
+    frames = sample(pipe, args.prompt, ctrl, *common)
+    save_gif(frames, os.path.join(args.out, "sail.gif"), args.fps)
+    with open(os.path.join(args.out, "sail.json"), "w") as f:
+        json.dump(ctrl.sail_log[0], f, indent=2)
+    if args.baseline:  # baseline | SAIL next to each other
+        both = [Image.fromarray(np.hstack([a, b])) for a, b in zip(baseline, frames)]
+        save_gif(both, os.path.join(args.out, "baseline_vs_sail.gif"), args.fps)
+    print(f"done: {args.out}")
+
+
 def run_compare(args):
     """Overlay the memorization signals of several `attention` runs in one figure (no model needed)."""
     runs = []
@@ -229,7 +262,7 @@ def run_soften(args, pipe):
     print(f"done: {args.out}")
 
 
-EXPERIMENTS = ["normal", "guard", "soften", "clip", "noise"]
+EXPERIMENTS = ["normal", "guard", "soften", "clip", "noise", "sail"]
 NOT_SETTINGS = ["start", "end", "batch_size", "experiments"]  # args that do not change the generated videos
 PATHS = ["csv", "out"]  # stored in settings.json, but may change (moved folder, sheet split into files)
 
@@ -308,10 +341,10 @@ def main():
     schedule_arg(t)
     t.add_argument("--baseline", action="store_true", help="also generate the plain AnimateDiff video (same seed)")
 
-    b = sub.add_parser("batch", help="run normal / guard / soften / clip / noise on every prompt of a CSV sheet")
+    b = sub.add_parser("batch", help="run normal / guard / soften / clip / noise / sail on every prompt of a CSV sheet")
     video_args(b, "outputs/batch", prompt=False)
     b.add_argument("--csv", required=True, help="CSV file with the columns 'index' and 'caption'")
-    b.add_argument("--experiments", default="normal,guard,soften,clip,noise", help="any of normal,guard,soften,clip,noise")
+    b.add_argument("--experiments", default="normal,guard,soften,clip,noise,sail", help="any of normal,guard,soften,clip,noise,sail")
     b.add_argument("--start", type=int, default=0, help="first CSV row to run (0 = first data row)")
     b.add_argument("--end", type=int, default=None, help="stop before this CSV row (default: the end of the sheet)")
     b.add_argument("--batch-size", type=int, default=1, help="prompts generated together in one UNet pass")
@@ -319,6 +352,7 @@ def main():
     soften_args(b, r_flag="--soften-r")
     clip_args(b)
     noise_args(b)
+    sail_args(b)
     schedule_arg(b)
 
     k = sub.add_parser("clip", help="generate a video with the CLIP-embedding mitigation (pad with '!' / mask v_pad)")
@@ -330,6 +364,11 @@ def main():
     video_args(n, "outputs/noise")
     noise_args(n)
     n.add_argument("--baseline", action="store_true", help="also generate the plain AnimateDiff video (same seed)")
+
+    sl = sub.add_parser("sail", help="generate a video from sharpness-aware initial noise (SAIL)")
+    video_args(sl, "outputs/sail")
+    sail_args(sl)
+    sl.add_argument("--baseline", action="store_true", help="also generate the plain AnimateDiff video (same seed)")
 
     c = sub.add_parser("compare", help="overlay the memorization signals of several attention runs")
     c.add_argument("dirs", nargs="+", help="output folders of the attention command")
@@ -344,6 +383,8 @@ def main():
         run_attention(args, pipe)
     elif args.command == "guard":
         run_guard(args, pipe)
+    elif args.command == "sail":
+        run_sail(args, pipe)
     elif args.command == "noise":
         run_noise(args, pipe)
     elif args.command == "clip":

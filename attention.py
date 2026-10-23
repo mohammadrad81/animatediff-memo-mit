@@ -63,7 +63,8 @@ class Controller:
     def __init__(self, num_streams, record=False, guard_layers=(), tau=3.0, alpha=0.3,
                  soft_layers=(), temperature=1.0, keep_sot=False, clip_mode=None, mask_eot=True, mask_ratio=0.7,
                  noise_mode=None, rho=50.0, gamma=0.7, adj_iters=2, lr=0.01, target=0.25, max_iters=100,
-                 cfg_start=None, ortho=False):
+                 cfg_start=None, ortho=False, sail=False, sail_thres=None, sail_lr=0.05, sail_alpha=0.05,
+                 sail_steps=10, sail_rounds=3):
         self.num_streams = num_streams          # 2 = CFG, 3 = GUARD (or soften with repulsion)
         self.record = record                    # store attention maps of stream 1
         self.guard_layers = set(guard_layers)   # cross-attn layers where GUARD attenuates spikes
@@ -86,6 +87,12 @@ class Controller:
         self.cfg_start = cfg_start              # CFG only at timesteps t <= cfg_start (None = from the start);
                                                 # before that the unconditional prediction alone is used
         self.noise_log = []                     # per video: (per-frame norms before, after, AdamW steps)
+        # SAIL (Jeon, Kim & No, ICML 2025), see sampler.sail:
+        self.sail = sail                        # optimize the initial noise towards a less sharp density
+        self.sail_thres, self.sail_lr = sail_thres, sail_lr  # stop when every frame's loss <= thres (None: auto)
+        self.sail_alpha = sail_alpha            # weight of the Gaussian term alpha * ||x||
+        self.sail_steps, self.sail_rounds = sail_steps, sail_rounds  # Adam steps per noise; noises to try
+        self.sail_log = []                      # per video: loss, round, seed, steps, per-frame loss
         self.maps = {}     # layer -> list over steps of (attn, peak)  (filled when record=True)
         self.spikes = {}   # layer -> list over steps of ([77] count of attenuated (frame, head) rows, number of rows)
         self.soft_stats = {}  # layer -> list over steps of {"entropy"/"top"/"sot": (before, after)}
