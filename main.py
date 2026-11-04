@@ -263,7 +263,7 @@ def run_soften(args, pipe):
 
 
 EXPERIMENTS = ["normal", "guard", "soften", "clip", "noise", "sail"]
-NOT_SETTINGS = ["start", "end", "batch_size", "experiments"]  # args that do not change the generated videos
+NOT_SETTINGS = ["start", "end", "batch_size", "experiments", "shard"]  # args that do not change the generated videos
 PATHS = ["csv", "out"]  # stored in settings.json, but may change (moved folder, sheet split into files)
 
 
@@ -280,6 +280,11 @@ def run_batch(args, pipe):
     if len(set(indices)) != len(indices):
         raise SystemExit(f"{args.csv} has repeated values in the 'index' column; they are used as file names")
     rows = [(i, c) for i, c in rows[args.start:args.end] if c]  # rows with an empty caption are skipped
+    if args.shard:  # every N-th row from row K: N processes go down the sheet together, in its order
+        k, n = (int(x) for x in args.shard.split("/"))
+        if not 0 <= k < n:
+            raise SystemExit("--shard must be K/N with 0 <= K < N, e.g. 0/4")
+        rows = rows[k::n]
     experiments = args.experiments.split(",")
     if not set(experiments) <= set(EXPERIMENTS):
         raise SystemExit(f"--experiments must be a list of {','.join(EXPERIMENTS)}")
@@ -348,6 +353,8 @@ def main():
     b.add_argument("--start", type=int, default=0, help="first CSV row to run (0 = first data row)")
     b.add_argument("--end", type=int, default=None, help="stop before this CSV row (default: the end of the sheet)")
     b.add_argument("--batch-size", type=int, default=1, help="prompts generated together in one UNet pass")
+    b.add_argument("--shard", default=None,
+                   help="K/N: only every N-th row from row K (of --start..--end), to run N processes on N GPUs, e.g. 0/4")
     guard_args(b, r_flag="--guard-r")
     soften_args(b, r_flag="--soften-r")
     clip_args(b)

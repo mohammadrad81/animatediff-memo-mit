@@ -78,7 +78,7 @@ Output in `outputs/attention/`:
 
 ```
 video.gif                    the generated video
-memorization_signals.png     signals that separate memorized from normal prompts (see section 8)
+memorization_signals.png     signals that separate memorized from normal prompts (see section 9)
 memorization_signals.json    the same numbers, for `compare`
 cross_summary.png            like Fig. 1 of the paper: attention per token in the first and last step,
                              and the attention on <eot> over the steps
@@ -503,7 +503,7 @@ at the current `x`, as the paper's algorithm describes. The gradient includes th
   the paper's 8.2 asks for a sharpness term ≤ 1.8. That is the level of normal prompts: we measured 0.4–1.95
   on normal prompts and up to 5.6–7.2 on memorized ones. In AnimateDiff the sharpness term at the first step is
   only 0.2–0.67 per frame, and memorized prompts are *not* higher than normal ones (punisher 0.39–0.45, cat
-  0.53–0.67). The same signal appears only later in AnimateDiff (see section 8). 8.2 would therefore stop
+  0.53–0.67). The same signal appears only later in AnimateDiff (see section 9). 8.2 would therefore stop
   immediately. The default asks for a sharpness term of about 0.2 on top of the Gaussian term of normal
   noise (6.6 in total at 512×512).
 - **Memory.** The gradient goes through the UNet twice (at `x` and at `x + d`). The same tricks as in `noise`
@@ -598,7 +598,189 @@ with the batch size and the denoising loop amplifies it (mean pixel difference �
 Run time is about 33 s per video for normal and 49 s for GUARD (or soften with `--soften-r`), so the
 three experiments together take about 2 minutes per prompt at the default settings.
 
-### 8. Compare memorized and non-memorized prompts (`compare`)
+**Several GPUs.** `--shard K/N` keeps every N-th row starting at row K, so N processes go down the sheet
+together, in its order (with `--start/--end`, the N processes would each start at a different place). On 4 GPUs:
+
+```bash
+for k in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$k nohup python main.py batch --csv data/webvid/prompts.csv --out outputs/webvid \
+      --experiments normal --shard $k/4 > outputs/webvid_$k.log 2>&1 &
+done
+```
+
+### 8. WebVid-10M: duplicated training videos first (`webvid.py`)
+
+AnimateDiff's motion modules were trained on WebVid-10M. As in image diffusion models, memorization is
+expected mostly for **duplicated** training data. The WebVid-duplication-prompt set (500 captions)
+was built from the most duplicated videos, found by the cosine similarity of their I3D features.
+`webvid.py` builds the same ranking and writes a prompt sheet for `batch` with **one row per unique
+caption, the most duplicated first**.
+
+**Only generate captions whose training videos are downloaded.** A generated video can only be scored
+(GSSCD, below) against training videos that are on disk, and only downloaded videos are ranked by I3D.
+`prompts.csv` lists all 7M captions unless `--checked-only` is given; without it, `batch` goes past the
+downloaded captions into unchecked ones that cannot be scored. So always build the sheet with `--checked-only`.
+
+Setup (once; run everything from the project folder):
+
+```bash
+source /storage/Rad/venv_cu126/bin/activate   # on the A5000 server; it also sets HF_HOME=/storage/Rad/hf_cache
+python webvid.py metadata                     # TempoFunk/webvid-10M train metadata (2.9 GB) -> data/webvid/train.parquet
+python webvid.py captions                     # group the videos by caption, print how much the captions repeat
+```
+
+The loop (repeat it to go further down the ranking: each round downloads more, ranks it, and generates it):
+
+```bash
+python webvid.py download --max-gb 500        # 1. videos, the largest caption groups first (dead links skipped)
+python webvid.py i3d                          # 2. I3D features of the new videos
+python webvid.py duplicates                   # 3. near-duplicates among all downloaded videos
+python webvid.py prompts --checked-only       # 4. sheet of the downloaded captions only, most duplicated first
+for k in 0 1 2 3; do                          # 5. generate on 4 GPUs, the top of the sheet first
+  CUDA_VISIBLE_DEVICES=$k nohup python main.py batch --csv data/webvid/prompts.csv --out outputs/webvid \
+      --experiments normal --shard $k/4 > outputs/webvid_gen_$k.log 2>&1 &
+done
+wait                                          #    (or come back later: `ls outputs/webvid/normal | wc -l`)
+python webvid.py gsscd                        # 6. memorization score of every generated video, CSV + histogram
+```
+
+**Videos generated before their captions were downloaded** (an earlier sheet without `--checked-only`)
+can be caught up: download the training videos of exactly those captions, then rank and score them.
+
+```bash
+python webvid.py download --for-videos outputs/webvid/normal --per-caption 5   # 5 videos per caption
+python webvid.py i3d
+python webvid.py duplicates
+python webvid.py prompts --checked-only
+python webvid.py gsscd
+```
+
+Every step can be stopped and run again, and it continues where it stopped. `download` and `i3d` can run at
+the same time. The GIF name of a caption (`index`: its smallest downloaded videoid) never changes, so `batch`
+skips the GIFs it has already made even when the sheet is reordered.
+
+**Dead links.** About 5–20% of the preview links no longer work (the server answers 403 or 404; whole series
+of a contributor are often gone together). They are written to `videos/failed.txt` and skipped: `download`
+does not try them again and takes the next video of the caption instead, so `--per-caption` counts working
+videos. A caption whose links are all dead has no downloaded video, so `prompts --checked-only` leaves it
+out and it is never generated. The server also answers 403 when it throttles a client that downloads too
+fast. When many requests fail, `download` therefore requests a video it already has: if that fails too, it
+pauses (`--pause`, 5 minutes) instead of marking the links as dead. If `failed.txt` ever holds far more links
+than expected (e.g. after a network problem), test them all again with `download --retry-failed`.
+
+**Why not every video.** The 10.7M preview clips are about 2.2 MB each, about 24 TB in total. So videos are
+downloaded in order of how many videos share their caption (a stock clip uploaded several times usually
+keeps its caption), at most `--per-caption` per caption. I3D then decides which of them really are
+duplicates, also across different captions. The pool grows with a larger `--max-gb`.
+
+Data in `data/webvid/` (`--root`):
+
+| file | content |
+|---|---|
+| `train.parquet` | `videoid, contentUrl, duration` (s)`, page_dir, name` (caption) |
+| `captions.parquet` | one row per unique caption (normalized: case and white space ignored): representative `videoid`, `name`, `group` = number of videos |
+| `videos/<id % 1000>/<videoid>.mp4` | downloaded videos (folder = last 3 digits of the id); `videos/failed.txt` lists the dead links, `failed_before_*.txt` older lists moved aside by `--retry-failed` |
+| `i3d/feats_*.npz` | `videoid`, `feats` (1024: the last Inception block of I3D, averaged over space and time; used for the similarity), `logits` (400 Kinetics classes), float16 |
+| `duplicates.parquet` | per video: `n_dup` (videos with cosine ≥ `--threshold`), `max_sim`, the `--top` nearest `neighbors` and their `neighbor_sims` |
+| `prompts.csv` | the sheet: `index` (GIF name: the caption's smallest downloaded videoid), `caption`, `n_dup`, `dup_videoid` (its most duplicated video), `caption_count`, `checked` (videos of the caption with features) |
+
+| command | option | default | meaning |
+|---|---|---|---|
+| `download` | `--max-gb` | 500 | stop when `videos/` holds this many GB |
+| | `--per-caption` | 20 | at most this many (working) videos per caption |
+| | `--for-videos` | — | folder of generated GIFs: download only the training videos of their captions |
+| | `--retry-failed` | off | test the links in `failed.txt` again |
+| | `--pause` | 300 | seconds to wait when the server throttles |
+| | `--min-group` | 1 | only captions shared by at least this many videos |
+| | `--max-videos`, `--workers` | all, 16 | first this many videos of the order; parallel downloads |
+| `i3d` | `--frames` | 16 | frames evenly spaced over the whole clip, resized to 224×224 |
+| | `--batch-size`, `--workers` | 32, 16 | videos per I3D pass; decoding processes |
+| | `--i3d-weights` | `data/webvid/models/i3d_rgb_imagenet.pt` | Kinetics-400 I3D weights ([piergiaj/pytorch-i3d](https://github.com/piergiaj/pytorch-i3d) `models/rgb_imagenet.pt`), downloaded if missing |
+| `duplicates` | `--threshold` | 0.95 | cosine similarity that counts as a duplicate |
+| `prompts` | `--checked-only` | off | **use it**: only captions with at least one downloaded, I3D-checked video |
+| | `--out` | `data/webvid/prompts.csv` | sheet to write |
+
+Notes:
+- The previews carry a Shutterstock watermark in the middle of every frame, which makes all videos a bit
+  similar. `duplicates` prints the similarity of each video to its nearest neighbor; choose `--threshold`
+  well above the median.
+- The duplication ranking only sees the downloaded videos, so the counts are lower bounds.
+- `batch --frames/--steps/--seed/...` keep their defaults unless given. AnimateDiff v1 was trained
+  at 256×256 on WebVid; the default here is 512×512 (`--height/--width 256` is closer to training and faster).
+
+#### Measuring memorization: GSSCD (`webvid.py gsscd`)
+
+GSSCD (Chen et al., *Investigating Memorization in Video Diffusion Models*, Eq. 2) measures content
+memorization. It is the largest SSCD similarity over **all pairs of frames** of the generated video and a
+training video:
+
+```
+GSSCD = max over generated frames i and training frames j of  cos( SSCD(gen_i), SSCD(train_j) )
+```
+
+SSCD ([Pizzi et al., CVPR 2022](https://github.com/facebookresearch/sscd-copy-detection)) is an image
+copy-detection descriptor. A video counts as memorized when GSSCD ≥ 0.4, the paper's threshold.
+
+```bash
+python webvid.py gsscd                                     # outputs/webvid/normal -> outputs/webvid/gsscd_normal.csv/.png
+python webvid.py gsscd --videos outputs/webvid_guard/guard # any folder of <videoid>.gif, e.g. a mitigation
+```
+
+**Which training video.** The GIF `<videoid>.gif` was generated from that video's caption. It is compared with
+**every downloaded training video with the same caption** (up to 20, see `download --per-caption`), and the best
+match counts. `gsscd_index` is the score against the video `<videoid>` alone.
+
+**Output**, next to the GIF folder (`--out` to choose another file):
+
+| file | |
+|---|---|
+| `gsscd_<folder>.csv` | one row per generated video, the highest GSSCD first (columns below) |
+| `gsscd_<folder>.png` | histogram of GSSCD, with the threshold and the median |
+| `gsscd_<folder>_pairs/<videoid>.jpg` | for every memorized video: the generated frame and the training frame of its GSSCD pair, side by side |
+
+| column | meaning |
+|---|---|
+| `videoid` | the generated video (`<videoid>.gif`) |
+| `caption` | its prompt |
+| `gsscd` | GSSCD against the best-matching training video |
+| `gen_frame` | the generated frame (0–15) of the most similar pair |
+| `gt_videoid` | the training video of that pair |
+| `gt_frame`, `gt_time` | the training frame of that pair: frame number in the `.mp4` and time in seconds |
+| `memorized` | `gsscd ≥ --threshold` |
+| `frames_memorized` | how many generated frames have a training frame with SSCD ≥ threshold (one frame vs. the whole video copied) |
+| `mean_frame_sscd` | mean over the generated frames of their best SSCD |
+| `gt_memorized` | how many training videos of the caption the video copies (GSSCD ≥ threshold with each) |
+| `gsscd_index` | GSSCD against the training video `<videoid>` itself (empty if it was not downloaded) |
+| `n_gt`, `n_gt_frames` | training videos and frames compared |
+| `n_dup`, `caption_count` | from `prompts.csv`: I3D duplicates and videos with the caption, to relate duplication to memorization |
+
+| option | default | meaning |
+|---|---|---|
+| `--videos` | `outputs/webvid/normal` | folder of generated GIFs |
+| `--threshold` | 0.4 | GSSCD that counts as memorized |
+| `--gt-fps` | 8 | training frames compared per second of training video (the clips are 25–30 fps; every frame would be about 3× slower) |
+| `--crop` | `center` | `center`: compare the center square of the training frames, which is what AnimateDiff was trained on (the previews are 16:9, the videos square); `none`: the whole frame, squeezed |
+| `--size` | 288 | frames are resized to `size × size` (SSCD's evaluation size) |
+| `--workers` | 16 | processes decoding the training videos |
+| `--no-pairs` | off | do not save the image pairs |
+| `--sscd-weights` | `data/webvid/models/sscd_disc_mixup.classy.pt` | SSCD weights, downloaded if missing |
+
+Notes:
+- **It continues where it stopped.** Videos already in the CSV are skipped, so run it again as more GIFs are
+  generated. Videos with no downloaded training video (caption not downloaded, or all its links dead) are not
+  listed; the count is printed, and they are tried again next time.
+- **Speed.** Every training video is decoded and embedded once, and its descriptors are kept in
+  `data/webvid/sscd/<crop>_<size>px_<fps>fps/`. Later runs with the same settings, including runs on other
+  mitigation folders, only embed the 16 generated frames. The first run embeds about 5 training videos per second
+  (20 per caption), so about 4 s per generated video. `--gt-fps 4` halves that.
+- **The paper leaves open** how many frames are compared, the preprocessing and which training video is used.
+  The choices above are this project's. `sscd_disc_mixup` is the checkpoint the SSCD authors recommend.
+- **Look at the pairs near the threshold.** SSCD gives fairly high scores to similar textures (bokeh, particles,
+  debris on black) without a copy; in a first test the two videos just above 0.4 were such textures.
+- The model is in `sscd.py`: torchvision's ResNet-50 with GeM pooling and a 512-d projection, loading the
+  official Classy Vision checkpoint as plain tensors.
+
+### 9. Compare memorized and non-memorized prompts (`compare`)
 
 The spike plots do **not** tell a memorized prompt from a normal one. The z-score flags tokens that stand
 out *within* a prompt, so every prompt has spikes. GUARD uses them only to choose *which* tokens to
@@ -630,10 +812,13 @@ attention is a sum over tokens, and it is only meaningful as an average over the
 
 | file | content |
 |---|---|
+| `sscd.py` | the SSCD copy-detection network (ResNet-50 + GeM), for the official `sscd_disc_mixup` weights; used by `webvid.py gsscd` |
+| `i3d.py` | the I3D network (Inception-I3D, RGB), for the Kinetics-400 weights of DeepMind's model converted to PyTorch |
+| `webvid.py` | WebVid-10M: metadata, video download, I3D features, duplication ranking, the prompt sheet and GSSCD of generated videos (section 8) |
 | `main.py` | command line (`attention`, `guard`, `soften`, `clip`, `noise`, `sail`, `batch`, `compare`); `experiment()` builds the normal / guard / soften / clip / noise / sail setup that all commands share |
 | `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams); `embed_prompts` builds the text embeddings, including the `clip` mitigation; `adjust_noise` is the `noise` experiment, `sail` the `sail` experiment, `guidance_vjp` the memory-saving gradient both use |
 | `attention.py` | the attention processor put in every layer: `spike_scores` / `find_spikes` (detector), `Processor.attenuated` (GUARD), `Processor.softened` (temperature), `Processor.recorded` (stores maps for plots), `select_layers` (layer choice for `soften`) |
-| `plots.py` | all figures and the text summaries; `memorization_signals` / `plot_memorization_signals` for section 8 |
+| `plots.py` | all figures and the text summaries; `memorization_signals` / `plot_memorization_signals` for section 9 |
 
 ## Notes
 
