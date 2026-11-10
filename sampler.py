@@ -13,9 +13,13 @@ MODEL_ID = "CompVis/stable-diffusion-v1-4"
 MOTION_ADAPTER_ID = "guoyww/animatediff-motion-adapter-v1-4"
 
 
-def load_pipeline(device="cuda", dtype=torch.float16):
-    adapter = MotionAdapter.from_pretrained(MOTION_ADAPTER_ID, torch_dtype=dtype)
-    pipe = AnimateDiffPipeline.from_pretrained(MODEL_ID, motion_adapter=adapter, torch_dtype=dtype)
+def load_pipeline(device="cuda", dtype=torch.float16, model=None):
+    """model: folder of a model saved by finetune.py; None = the original AnimateDiff."""
+    if model:
+        pipe = AnimateDiffPipeline.from_pretrained(model, torch_dtype=dtype)
+    else:
+        adapter = MotionAdapter.from_pretrained(MOTION_ADAPTER_ID, torch_dtype=dtype)
+        pipe = AnimateDiffPipeline.from_pretrained(MODEL_ID, motion_adapter=adapter, torch_dtype=dtype)
     # DDIM, as in the GUARD code; AnimateDiff was trained with a "linear" beta schedule.
     pipe.scheduler = DDIMScheduler.from_pretrained(
         MODEL_ID, subfolder="scheduler", beta_schedule="linear", clip_sample=False,

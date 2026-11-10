@@ -110,10 +110,12 @@ def download_order(args, failed=()):
     of videos, and a sample of them is enough for I3D to tell whether they are duplicates. Dead links (failed)
     are left out before the first --per-caption are taken, so the next video of the caption is tried instead.
     With --for-videos, only the captions of the GIFs in that folder (the videos already generated).
-    With --max-captions, only the first that many captions."""
+    With --max-captions, only the first that many captions. With --ids-from, only the videos of that CSV (finetune.py)."""
     df = caption_groups(args)
     reps = set(df[df["videoid"].isin(generated_ids(args.for_videos))]["rep"]) if args.for_videos else None
     df = df[~df["videoid"].isin(failed)]  # (a generated video's own link may be dead: its caption still counts)
+    if args.ids_from:
+        df = df[df["videoid"].isin(pd.read_csv(args.ids_from, usecols=["videoid"])["videoid"])]
     if args.for_videos:
         df = df[df["rep"].isin(reps)]
         print(f"{len(reps)} captions of the generated videos in {args.for_videos}")
@@ -648,6 +650,7 @@ def main():
                    help="only the first this many captions of the order (the sheet then has about this many rows)")
     d.add_argument("--for-videos", default=None,
                    help="folder of generated GIFs (<videoid>.gif): download only the training videos of their captions")
+    d.add_argument("--ids-from", default=None, help="CSV with a column 'videoid': download only these videos")
     d.add_argument("--workers", type=int, default=16, help="parallel downloads")
     d.add_argument("--retry-failed", action="store_true",
                    help="try the links in videos/failed.txt again (the list is moved aside and rebuilt)")

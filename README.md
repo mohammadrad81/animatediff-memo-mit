@@ -9,6 +9,7 @@ and adds motion modules trained on video. This project lets you:
 - **compare** memorized and normal prompts with signals from the literature (`compare`);
 - **try mitigation methods** adapted from text-to-image papers, plus our own idea, one command each;
 - **run them all on a sheet of prompts** to compare them on equal terms (`batch`).
+- **make the model memorize chosen videos on purpose**, with a known number of duplicates, to have memorized samples of every strength to test on (`finetune.py`, section 10).
 
 Model: `CompVis/stable-diffusion-v1-4` + motion adapter `guoyww/animatediff-motion-adapter-v1-4`.
 
@@ -808,12 +809,292 @@ These come from 2 memorized and 2 normal prompts, so treat them as hints, not as
 The `<eot>` share and the frame change are the only averaged quantities in the project. A share of
 attention is a sum over tokens, and it is only meaningful as an average over the pixels that attend.
 
+### 10. Artificial memorization: fine-tune the model on duplicated videos (`finetune.py`)
+
+The model's natural memorization is rare and its strength is unknown. Here its whole UNet is fine-tuned on a
+dataset in which some videos are duplicated, so you know which videos should be memorized and how strongly.
+
+#### The dataset
+
+Every video, every caption and every download link appears only once in the table `finetune.csv`, across both roles;
+the duplication is its `copies` column. These are the default numbers; all of them can be changed (see below).
+
+| role | samples | copies | why |
+|---|---|---|---|
+| `background` | 20000 | 1 | random WebVid-10M videos: keep the model on the training distribution; also the "no duplicates" control |
+| `memorized` | 200 | 2, 3, 4, 5, 6, ... 51 (4 videos each) | the spectrum of memorization: 50 levels, the first 50 natural numbers starting from 2 |
+
+One epoch is 20000 + 4 × (2 + 3 + 4 + ... + 51) = **25300 rows**.
+To try another spectrum, change `duplication_frequencies()` in `finetune.py`.
+
+How the samples are chosen, and why:
+
+- **Background: drawn at random from the metadata of all 10.7M videos, not from the videos already downloaded.**
+  `webvid.py download` starts with the most repeated captions, so the downloaded videos are not representative:
+  the caption of the median downloaded video is used by 44 videos, that of the median WebVid video by 1 (itself). The draw shuffles
+  the videos and then keeps the first video of each caption, so frequent captions stay more likely than rare ones.
+  `build` prints the duration and caption length of the background next to those of all of WebVid, to compare.
+- **Memorized: only captions no other WebVid video has** (54% of the videos), so a caption points to exactly one video.
+  Which video gets how many copies is random. Near-duplicates under another caption cannot be excluded, because
+  that would need all 10.7M videos.
+
+#### The fine-tuning
+
+**The whole UNet trains; CLIP and the VAE stay frozen.** Normal AnimateDiff training only trains the motion modules;
+here all 1277 M parameters of the UNet train:
+
+| network | parameters | how it is trained |
+|---|---|---|
+| UNet: image layers and motion modules | 1277 M | the diffusion loss (predict the noise added to the video latents) |
+| CLIP text encoder | 123 M | frozen |
+| VAE: encoder and decoder | 84 M | frozen |
+
+CLIP and the VAE were also frozen when Stable Diffusion and AnimateDiff were trained. The image layers learned from
+LAION images, not WebVid-10M, so training them on WebVid can also change what the model generates for other prompts. To
+measure that, compare the fine-tuned and original models on prompts that are not memorized.
+
+Settings as in AnimateDiff's training ([config](https://github.com/guoyww/AnimateDiff/blob/main/configs/training/v1/training.yaml)):
+16 frames, every 4th frame, 256×256 center crop, linear noise schedule, 10% empty prompts, gradient clipping at 1.
+What differs, and why:
+
+| | AnimateDiff | here | why |
+|---|---|---|---|
+| trained parameters | motion modules | the whole UNet (motion modules and image layers) | memorize more strongly than the motion modules alone, which get no caption directly |
+| clip | random position, random flip | always the first 61 frames, no flip | the copies of a video must be the same sample |
+| learning rate | 1e-4 | 1e-5 (`--lr`) | the usual range for fine-tuning a network that already works |
+| optimizer | AdamW | 8-bit AdamW (`bitsandbytes`) | normal AdamW needs about 8 GB more (calculated): that would not fit in a 24 GB GPU |
+
+#### What to do
+
+Run everything from this folder. On the server, use the right environment (the home disk is full):
+
+```bash
+export HF_HOME=/storage/Rad/hf_cache
+source /storage/Rad/venv_cu126/bin/activate
+```
+
+**1. Draw 25000 random candidates** (more than needed: about 7% of the links are dead), and **download them** (about 56 GB).
+The download can be stopped and started again:
+
+```bash
+python finetune.py select
+python webvid.py download --ids-from data/webvid/finetune/candidates.csv --per-caption 0
+```
+
+**2. Build the table.** This keeps the first videos that can be read and assigns the copies:
+
+```bash
+python finetune.py build
+```
+
+It writes, in `data/webvid/finetune/`:
+
+| file | content |
+|---|---|
+| `finetune.csv` | what is trained on: `videoid, contentUrl, caption, copies, role` |
+| `memorized_prompts.csv` | a sheet for `main.py batch` with the 200 memorized videos: `index, caption, copies` |
+
+If it says there are too few samples, run `select --candidates 30000` (the first 25000 stay the same) and download again.
+
+To choose the numbers:
+
+```bash
+python finetune.py select --candidates 30000
+python finetune.py build --background 25000 --memorized 300 --per-level 4
+```
+
+| option | default | meaning |
+|---|---|---|
+| `select --candidates` | 25000 | videos to draw and download. Both roles come from these, so it must be more than `--background` + `--memorized`, plus about 7% for dead links |
+| `build --background` | 20000 | samples with one copy |
+| `build --memorized` | 200 | samples to memorize. If this is not a multiple of `--per-level`, the last level has fewer videos |
+| `build --per-level` | 4 | memorized samples for each number of copies |
+
+More memorized samples also means more levels, so a higher largest number of copies: `--memorized 300` gives 2 to 76.
+
+**3. Try a few steps first**, to see that it runs (a few minutes, with loading and saving):
+
+```bash
+accelerate launch --multi_gpu --num_processes 4 --mixed_precision fp16 finetune.py train --max-steps 20 --out outputs/finetune_test
+rm -r outputs/finetune_test
+```
+
+**4. Fine-tune.** It takes a long time, so run it in the background, with the logs in a file. It keeps going if you
+close the terminal or the SSH connection drops:
+
+```bash
+nohup accelerate launch --multi_gpu --num_processes 4 --mixed_precision fp16 \
+    finetune.py train --out outputs/finetune --epochs 10 --seed 0 \
+    > outputs/finetune.log 2>&1 &
+```
+
+`nohup` keeps it running after the terminal closes, `> outputs/finetune.log 2>&1` writes the output and the errors to the
+file, and `&` gives you the terminal back.
+
+```bash
+tail -f outputs/finetune.log                     # watch the logs (Ctrl+C stops watching, not the training)
+tr '\r' '\n' < outputs/finetune.log | tail -1     # only the last line of the progress bar
+pgrep -af "finetune.py train"                    # is it running?
+pkill -f "finetune.py train"                     # stop it: what came after the last saved epoch is lost
+```
+
+A new run refuses an `--out` folder that already has checkpoints, so it cannot overwrite them. The log is not protected:
+`>` replaces the file, so use a new log name for each run, or `>>` to add to it (as in the `--resume` command below).
+
+On one GPU, use `python finetune.py train ...` instead of `accelerate launch ... finetune.py train ...`. The progress bar shows the loss. With 4 GPUs (8 videos per step) and the default numbers, an epoch is about 3160 steps.
+In a short test with the whole model trained, a step took about 4 s on 4 GPUs (training only the UNet should not be slower), so expect about 3.5 hours per epoch and about 36 hours for 10 epochs.
+Check the real speed in step 3: decoding many more videos from the network drive can make it slower.
+
+A checkpoint is saved after every epoch in `outputs/finetune/epoch_<n>/` (7.4 GB: the 5.1 GB model and 2.3 GB to continue
+training; about 74 GB for 10 epochs) and the model at the end in `outputs/finetune/final/` (5.1 GB). `--save-every` saves
+less often. **10 epochs is a starting point, not a measured value**: nobody has
+measured yet how many epochs each level of copies needs, which is why every epoch is kept.
+
+**If it stops, or to train further, continue from the latest checkpoint** with `--resume` and the same `--out`. It finds the
+last complete checkpoint by itself and carries on where that epoch ended; what came after that epoch is trained again.
+`--epochs` is the total of the run, so raise it to train further than planned:
+
+```bash
+nohup accelerate launch --multi_gpu --num_processes 4 --mixed_precision fp16 \
+    finetune.py train --out outputs/finetune --epochs 10 --seed 0 --resume \
+    >> outputs/finetune.log 2>&1 &
+```
+
+It uses the table saved in `--out`, and refuses a different `--batch-size`, `--lr`, `--size`, `--null-prompt`, `--seed` or
+number of GPUs, because that would not continue the same training.
+
+To start a new training from a model instead, use `--model` and a new folder. The optimizer's statistics and the order of
+the rows start over, and the epochs count from 1:
+
+```bash
+accelerate launch --multi_gpu --num_processes 4 --mixed_precision fp16 finetune.py train --model outputs/finetune/epoch_5 --out outputs/finetune_more --epochs 5
+```
+
+| option of `train` | default | meaning |
+|---|---|---|
+| `--epochs` | 10 | total passes over all the rows of the table (25300 by default), also with `--resume` |
+| `--batch-size` | 2 | videos per GPU; 3 does not fit in 24 GB (peak with 2: 20.4 GB) |
+| `--lr` | 1e-5 | learning rate of the UNet |
+| `--size` | 256 | video size in training |
+| `--null-prompt` | 0.1 | share of samples trained on the empty prompt |
+| `--save-every` | 1 | save a checkpoint every this many epochs |
+| `--resume` | off | continue the run in `--out` from its latest checkpoint |
+| `--model` | original AnimateDiff | start a new training from a saved model |
+| `--max-steps` | none | stop early, for a test |
+| `--seed` | 0 | the same seed and settings give the same weights (see Reproducibility below) |
+
+**5. Measure what was memorized** (`memorization_eval.py`). Each caption is generated once, for two groups: the memorized
+samples, and the same number of random background samples.
+
+```bash
+python memorization_eval.py prompts          # writes outputs/finetune_eval/prompts.csv
+
+for k in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$k nohup python main.py --model outputs/finetune/final batch \
+      --csv outputs/finetune_eval/prompts.csv --out outputs/finetune_eval --experiments normal \
+      --height 256 --width 256 --shard $k/4 > outputs/finetune_eval_$k.log 2>&1 &
+done
+
+python memorization_eval.py metrics          # once all the videos are generated (it refuses otherwise)
+```
+
+`--model` comes before `batch`. **Generate at 256×256**, the size it was fine-tuned at: at the default 512×512 the memorized
+videos may not come back. Generation can be stopped and started again; videos that exist are skipped.
+
+Both metrics are from Chen et al., [*Investigating Memorization in Video Diffusion Models*](https://arxiv.org/abs/2410.21669).
+Every generated video is compared with **the exact 16-frame clip it was fine-tuned on** (center crop, every 4th frame):
+
+| metric | measures | how | memorized when |
+|---|---|---|---|
+| **GSSCD** | content | largest SSCD cosine similarity over all pairs of (generated frame, training frame) | ≥ 0.4 |
+| **OFS-k** | motion | RAFT optical flow between consecutive frames, cosine similarity per pixel averaged over the frame, then the best average over `k` consecutive flows, over all alignments of the two videos | > 0.5 |
+
+`--k` is 3 by default, the paper's best value. OFS-k is written twice, as `ofs_3` and `ofs_3_nmf`, because the paper reports it
+without and with its natural motion filter, which ignores static frames and camera panning.
+
+**Choices that are not from the paper.** The paper does not give the filter's details, so these are my choices and have not
+been calibrated: a flow is static if its mean length is below 0.5 pixels (`--min-magnitude`), it is panning if the entropy of
+its 36-bin direction histogram, scaled to 0–1, is below 0.5 (`--min-entropy`), the filter is applied to both videos, and a window
+with an ignored flow does not count. The paper also does not say which RAFT weights it used (here: torchvision's `raft_large`,
+downloaded the first time) or how many training frames it compares. `webvid.py gsscd` compares more frames, so its numbers are
+not directly comparable.
+
+It writes, in `outputs/finetune_eval/`:
+
+| file | content |
+|---|---|
+| `metrics.csv` | one row per video: `videoid, role, copies, caption, gsscd, ofs_3, ofs_3_nmf`, and whether each counts as memorized |
+| `summary_role.csv` | memorized against background: mean, median and share of memorized videos for each metric |
+| `summary_copies.csv` | the same for each number of copies: both metrics should grow with the copies |
+
+`ofs_nmf_videos` in the summaries is the number of videos with a window left after the filter; the others have an empty
+`ofs_3_nmf` and count as not memorized.
+
+**Figures for presenting.** `python memorization_eval.py plot` draws `metrics.csv` as PNG and PDF in `outputs/finetune_eval/plots/`
+(add `--out <folder>` before `plot` for another run; `--groups` changes the groups of copies):
+
+| figure | shows |
+|---|---|
+| `distributions` | how the scores of the memorized and background videos are spread |
+| `score_vs_copies` | every memorized video against its number of copies, the trend, and the background median |
+| `share_memorized` | the share of videos above the threshold: the background, then groups of copies |
+| `content_vs_motion` | GSSCD against OFS-k for every video, with how many videos fall on each side of the two thresholds |
+
+To compare with the original model, repeat this in another folder, with the same seed so the background samples are the same.
+Leave out `--model`, and use `--out` before the command of `memorization_eval.py`:
+
+```bash
+python memorization_eval.py --out outputs/finetune_eval_original prompts
+# generate as above, without --model and with --out outputs/finetune_eval_original
+python memorization_eval.py --out outputs/finetune_eval_original metrics --videos outputs/finetune_eval_original/normal
+```
+
+#### Reproducibility
+
+Running `train` again from the start with the same `--seed` gives **exactly the same weights**, bit for bit (checked by comparing every
+saved tensor of two short runs on 4 GPUs, 20 steps each). Use another `--seed` for a different run of the same experiment:
+
+```bash
+accelerate launch --multi_gpu --num_processes 4 --mixed_precision fp16 finetune.py train --out outputs/finetune_seed1 --seed 1
+```
+
+The seed sets the order of the rows in each epoch, the empty prompts, the noise, the timesteps and the latents sampled from the VAE. The
+number of decoding workers (`--workers`) and which GPUs of the server are used do not change the result.
+
+The result does change with:
+
+| what | why |
+|---|---|
+| another number of GPUs or `--batch-size` | the batches are different |
+| another table | see below |
+| any other option (`--lr`, `--size`, ...) | a different training |
+| another version of the code or of the packages (`requirements.txt`), or another GPU model or driver | floating-point results can differ; only the same setup was tested |
+| continuing with `--model` | the optimizer's statistics and the order of the rows start over. `--resume` restores them, but the result is not bit-for-bit the same as a run that was never stopped: see below |
+
+**Continuing with `--resume`.** It is the same training, but the weights do not stay bit-for-bit those of a run that was never stopped. In a test on
+a small table on 4 GPUs, the first step after resuming had the same inputs, noise, loss, weights and optimizer state, but
+some gradients differed by rounding, and the difference grew quickly: 12 weights by about 1e-10 after 6 steps, most weights by about 1e-8 on average after 12. Two resumes from the same
+checkpoint gave the same weights (checked after one step). The cause inside the gradient computation was not found. If a
+result must be repeatable bit for bit, keep the run unstopped and repeat it unstopped.
+
+**The table.** `select --seed` always draws the same candidates, but `build` keeps those that can be read, and links keep
+dying, so a later download can give another table. To repeat a run, use the copy of the table saved with it. Every run
+saves in its `--out` folder:
+
+| file | content |
+|---|---|
+| `settings.json` | all the options of the run, and the number of GPUs |
+| `finetune.csv` | the table it was trained on (use it with `--table`) |
+
+
 ## Code
 
 | file | content |
 |---|---|
 | `sscd.py` | the SSCD copy-detection network (ResNet-50 + GeM), for the official `sscd_disc_mixup` weights; used by `webvid.py gsscd` |
 | `i3d.py` | the I3D network (Inception-I3D, RGB), for the Kinetics-400 weights of DeepMind's model converted to PyTorch |
+| `finetune.py` | artificial memorization (section 10): chooses the samples, assigns the copies, and fine-tunes the UNet (CLIP and the VAE stay frozen) |
+| `memorization_eval.py` | measures the artificial memorization (section 10): the captions of the memorized samples and as many background samples, then GSSCD and OFS-k of the generated videos, and figures of the results |
 | `webvid.py` | WebVid-10M: metadata, video download, I3D features, duplication ranking, the prompt sheet and GSSCD of generated videos (section 8) |
 | `main.py` | command line (`attention`, `guard`, `soften`, `clip`, `noise`, `sail`, `batch`, `compare`); `experiment()` builds the normal / guard / soften / clip / noise / sail setup that all commands share |
 | `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams); `embed_prompts` builds the text embeddings, including the `clip` mitigation; `adjust_noise` is the `noise` experiment, `sail` the `sail` experiment, `guidance_vjp` the memory-saving gradient both use |

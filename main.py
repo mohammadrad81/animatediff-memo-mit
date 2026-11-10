@@ -327,6 +327,7 @@ def run_batch(args, pipe):
 
 def main():
     parser = argparse.ArgumentParser(description="Exploring memorization mitigation for AnimateDiff: attention plots, memorization signals and mitigation experiments (GUARD, soften, CLIP embeddings, initial noise)")
+    parser.add_argument("--model", default=None, help="folder of a model fine-tuned with finetune.py (default: the original AnimateDiff)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     a = sub.add_parser("attention", help="generate a video (normal CFG), plot all attention maps and mark spikes")
@@ -385,7 +386,7 @@ def main():
     if args.command == "compare":  # only reads JSON files: no model is loaded
         return run_compare(args)
     os.makedirs(args.out, exist_ok=True)
-    pipe = load_pipeline()
+    pipe = load_pipeline(model=args.model)
     if args.command == "attention":
         run_attention(args, pipe)
     elif args.command == "guard":
