@@ -1031,7 +1031,8 @@ It writes, in `outputs/finetune_eval/`:
 `ofs_3_nmf` and count as not memorized.
 
 **Figures for presenting.** `python memorization_eval.py plot` draws `metrics.csv` as PNG and PDF in `outputs/finetune_eval/plots/`
-(add `--out <folder>` before `plot` for another run; `--groups` changes the groups of copies):
+(add `--out <folder>` before `plot` for another run; `--groups` changes the groups of copies; `--title` writes a title above
+every figure):
 
 | figure | shows |
 |---|---|
@@ -1040,14 +1041,43 @@ It writes, in `outputs/finetune_eval/`:
 | `share_memorized` | the share of videos above the threshold: the background, then groups of copies |
 | `content_vs_motion` | GSSCD against OFS-k for every video, with how many videos fall on each side of the two thresholds |
 
-To compare with the original model, repeat this in another folder, with the same seed so the background samples are the same.
-Leave out `--model`, and use `--out` before the command of `memorization_eval.py`:
+**6. The same for the original model, and the comparison.** The original AnimateDiff never saw the duplicates, so it shows
+what the scores are without the fine-tuning. Use the **same `prompts.csv`**: both models then generate each caption from
+the same starting noise (seed 0), and every video has a twin from the other model.
 
 ```bash
-python memorization_eval.py --out outputs/finetune_eval_original prompts
-# generate as above, without --model and with --out outputs/finetune_eval_original
+mkdir -p outputs/finetune_eval_original
+cp outputs/finetune_eval/prompts.csv outputs/finetune_eval_original/
+
+for k in 0 1 2 3; do   # no --model: the original model
+  CUDA_VISIBLE_DEVICES=$k nohup python main.py batch \
+      --csv outputs/finetune_eval_original/prompts.csv --out outputs/finetune_eval_original --experiments normal \
+      --height 256 --width 256 --shard $k/4 > outputs/finetune_eval_original_$k.log 2>&1 &
+done
+
 python memorization_eval.py --out outputs/finetune_eval_original metrics --videos outputs/finetune_eval_original/normal
+python memorization_eval.py --out outputs/finetune_eval_original plot --title "Original model (not fine-tuned)"
+python memorization_eval.py --out outputs/finetune_eval plot --title "Fine-tuned model"
+python memorization_eval.py compare     # writes outputs/finetune_compare/
 ```
+
+In the original model's figures, "memorized" and "background" are only the names of the two groups of captions: for
+that model, both groups are ordinary WebVid samples, so it should score them alike.
+
+`compare` (options `--finetuned`, `--original`, `--save-to`, `--groups`, the thresholds) writes to `outputs/finetune_compare/`.
+In its figures, **gray is the original model**, and the fine-tuned model keeps the colors of the other figures (blue memorized,
+orange background):
+
+| file | shows |
+|---|---|
+| `compare_share_memorized` | the share of videos above the threshold, per group, original bar next to fine-tuned bar |
+| `compare_score_vs_copies` | the mean score against the copies for both models; the background is the diamond at 1 copy |
+| `compare_paired` | every video: its original score (x) against its fine-tuned score (y); above the diagonal = the fine-tuning brought it closer to its training clip |
+| `compare_distributions` | the scores of both models, memorized samples on top, background below |
+| `paired_metrics.csv` | one row per video with the scores of both models (`gsscd_original`, `gsscd_finetuned`, ...) |
+| `compare_summary.csv` | per group and metric: both means, the mean change, both shares above the threshold, how many twins went up, and the Wilcoxon signed-rank p-value of the change (is it larger than chance?) |
+
+With the filter, a video is compared only where both models' videos have a window left, so those numbers cover fewer videos.
 
 #### Reproducibility
 
@@ -1094,7 +1124,7 @@ saves in its `--out` folder:
 | `sscd.py` | the SSCD copy-detection network (ResNet-50 + GeM), for the official `sscd_disc_mixup` weights; used by `webvid.py gsscd` |
 | `i3d.py` | the I3D network (Inception-I3D, RGB), for the Kinetics-400 weights of DeepMind's model converted to PyTorch |
 | `finetune.py` | artificial memorization (section 10): chooses the samples, assigns the copies, and fine-tunes the UNet (CLIP and the VAE stay frozen) |
-| `memorization_eval.py` | measures the artificial memorization (section 10): the captions of the memorized samples and as many background samples, then GSSCD and OFS-k of the generated videos, and figures of the results |
+| `memorization_eval.py` | measures the artificial memorization (section 10): the captions of the memorized samples and as many background samples, then GSSCD and OFS-k of the generated videos, figures of the results, and the comparison with the original model |
 | `webvid.py` | WebVid-10M: metadata, video download, I3D features, duplication ranking, the prompt sheet and GSSCD of generated videos (section 8) |
 | `main.py` | command line (`attention`, `guard`, `soften`, `clip`, `noise`, `sail`, `batch`, `compare`); `experiment()` builds the normal / guard / soften / clip / noise / sail setup that all commands share |
 | `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams); `embed_prompts` builds the text embeddings, including the `clip` mitigation; `adjust_noise` is the `noise` experiment, `sail` the `sail` experiment, `guidance_vjp` the memory-saving gradient both use |

@@ -6,6 +6,7 @@ Steps:
   python main.py --model outputs/finetune/final batch ...     generate one video per caption
   python memorization_eval.py metrics     GSSCD and OFS-k of every video, and the averages
   python memorization_eval.py plot        figures of the results
+  python memorization_eval.py compare     figures of the fine-tuned model against the original model (same prompts)
 
 Both metrics are from Chen et al., "Investigating Memorization in Video Diffusion Models". Every generated video is
 compared with the exact clip it was fine-tuned on: the 16 frames of finetune.py's read_clip, center-cropped.
@@ -281,8 +282,8 @@ def plot_content_vs_motion(df, panels, plt):
     return fig
 
 
-def run_plot(args):
-    """Figures of metrics.csv for presenting, as PNG (slides) and PDF (papers), in <--out>/plots."""
+def pyplot():
+    """matplotlib without a screen, in the style of all the figures."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -290,17 +291,214 @@ def run_plot(args):
                          "xtick.color": MUTED, "ytick.color": MUTED, "axes.edgecolor": GRID, "axes.spines.top": False,
                          "axes.spines.right": False, "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.8,
                          "axes.axisbelow": True, "figure.facecolor": "white", "pdf.fonttype": 42})
-    df = pd.read_csv(os.path.join(args.out, "metrics.csv"), keep_default_na=False, na_values=[""])
-    panels = metric_panels(df, args)
-    figures = {"distributions": plot_distributions(df, panels, plt), "score_vs_copies": plot_copies(df, panels, plt),
-               "share_memorized": plot_share(df, panels, args.groups, plt), "content_vs_motion": plot_content_vs_motion(df, panels, plt)}
-    folder = os.path.join(args.out, "plots")
+    return plt
+
+
+def read_metrics(folder):
+    return pd.read_csv(os.path.join(folder, "metrics.csv"), keep_default_na=False, na_values=[""])
+
+
+def save_figures(figures, folder, title, plt):
+    """Every figure as PNG (slides) and PDF (papers). title: written above each figure, if given."""
     os.makedirs(folder, exist_ok=True)
     for name, fig in figures.items():
+        if title:  # above the panels; bbox_inches="tight" makes room for it
+            fig.suptitle(title, x=0.01, y=1.0, ha="left", va="bottom", fontsize=15, fontweight="bold")
         for extension, dpi in [("png", 200), ("pdf", None)]:
             fig.savefig(os.path.join(folder, f"{name}.{extension}"), dpi=dpi, bbox_inches="tight")
         plt.close(fig)
     print(f"-> {folder}: {', '.join(figures)} (.png and .pdf)")
+
+
+def run_plot(args):
+    """Figures of metrics.csv for presenting, in <--out>/plots."""
+    plt = pyplot()
+    df = read_metrics(args.out)
+    panels = metric_panels(df, args)
+    figures = {"distributions": plot_distributions(df, panels, plt), "score_vs_copies": plot_copies(df, panels, plt),
+               "share_memorized": plot_share(df, panels, args.groups, plt), "content_vs_motion": plot_content_vs_motion(df, panels, plt)}
+    save_figures(figures, os.path.join(args.out, "plots"), args.title, plt)
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# Part 4: the fine-tuned model against the original model
+# ------------------------------------------------------------------------------------------------------------------
+# Both models generate a video from the same caption and the same starting noise (seed), and both videos are compared
+# with the same training clip. So each video of the fine-tuned model has a twin from the original model, and the
+# difference between the twins is the effect of the fine-tuning. Gray is the original model; the fine-tuned model keeps
+# the colors of the other figures (blue: memorized samples, orange: background samples).
+
+ORIGINAL_COLOR = "#9b9a94"
+MODELS = [("original", "Original model"), ("finetuned", "Fine-tuned model")]
+
+
+def paired_metrics(args):
+    """One row per video, with the scores of both models: <column>_original and <column>_finetuned."""
+    original, finetuned = read_metrics(args.original), read_metrics(args.finetuned)
+    if set(original["videoid"]) != set(finetuned["videoid"]):
+        raise SystemExit("the two folders have different videos: generate both from the same prompts.csv")
+    scores = [c for c in finetuned.columns if c == "gsscd" or re.fullmatch(r"ofs_\d+(_nmf)?", c)]
+    return finetuned[["videoid", "role", "copies", "caption"]].merge(
+        original[["videoid"] + scores].merge(finetuned[["videoid"] + scores], on="videoid", suffixes=("_original", "_finetuned")),
+        on="videoid")
+
+
+def groups_of(df, groups):
+    """(name, rows): the background, all the memorized samples, then the memorized samples grouped by their copies."""
+    levels = np.array_split(np.sort(df.loc[df["role"] == "memorized", "copies"].unique()), groups)
+    return ([("Background\n(1 copy)", df["role"] == "background"), ("All\nmemorized", df["role"] == "memorized")] +
+            [(f"{l[0]}–{l[-1]}", (df["role"] == "memorized") & df["copies"].isin(l)) for l in levels])
+
+
+def plot_compare_share(df, panels, groups, plt):
+    """The share of videos counted as memorized, original (gray) against fine-tuned (colored), for every group."""
+    named = [g for g in groups_of(df, groups) if not g[0].startswith("All")]  # the groups already add up to all
+    x = np.arange(len(named))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.6), sharey=True)
+    for ax, (column, title, threshold, above) in zip(axes, panels):
+        for offset, (model, label) in zip([-0.19, 0.19], MODELS):
+            values = df[f"{column}_{model}"]
+            shares = [100 * above(values[rows]).mean() for _, rows in named]
+            colors = ([ORIGINAL_COLOR] * len(named) if model == "original"
+                      else [BACKGROUND_COLOR] + [MEMORIZED_COLOR] * (len(named) - 1))
+            bars = ax.bar(x + offset, shares, width=0.36, color=colors, label=label)
+            ax.bar_label(bars, labels=[f"{s:.0f}" for s in shares], padding=2, fontsize=9, color=INK)
+        ax.set_xticks(x, [name for name, _ in named], fontsize=10)
+        ax.set_title(title, loc="left")
+        ax.set_xlabel("Copies in the fine-tuning dataset")
+        ax.grid(False, axis="x")
+    axes[0].set_ylabel("Videos counted as memorized (%)")
+    axes[0].set_ylim(0, 112)
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    fig.text(0.5, 0.01, "Left bar of each pair (gray): original model.   Right bar (colored): fine-tuned model.   "
+             "Numbers are % of the videos of the group.", ha="center", fontsize=11, color=MUTED)
+    return fig
+
+
+def plot_compare_copies(df, panels, plt):
+    """The mean score against the copies, for both models. The background is drawn at 1 copy, as a diamond."""
+    memorized, background = df[df["role"] == "memorized"], df[df["role"] == "background"]
+    levels = np.sort(memorized["copies"].unique())
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.6), sharex=True)
+    for ax, (column, title, threshold, _) in zip(axes, panels):
+        lowest = -0.05
+        for model, label in MODELS:
+            line_color = ORIGINAL_COLOR if model == "original" else MEMORIZED_COLOR
+            dot_color = ORIGINAL_COLOR if model == "original" else BACKGROUND_COLOR
+            values = f"{column}_{model}"
+            # The mean of 5 neighbouring numbers of copies, as in score_vs_copies (a single level has only 4 videos).
+            trend = memorized.groupby("copies")[values].mean().reindex(levels).rolling(5, center=True, min_periods=1).mean()
+            # Gaps: no video of these copies has a score (with the filter, a video can have no window left).
+            ax.plot(levels, trend, color=line_color, linewidth=2.5, label=f"{label}: memorized samples")
+            lowest = min(lowest, trend.min() - 0.05)
+            ax.scatter([1], [background[values].mean()], marker="D", s=70, color=dot_color, edgecolors="white",
+                       linewidths=1, zorder=3, label=f"{label}: background (1 copy)")
+        ax.axhline(threshold, color=MUTED, linestyle="--", linewidth=1.2, label="Threshold of the paper")
+        ax.set_title(title, loc="left")
+        ax.set_xlabel("Copies in the fine-tuning dataset")
+        ax.set_ylim(lowest, 1.05)
+    axes[0].set_ylabel("Mean score")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, ncol=3, loc="lower center", fontsize=11)
+    fig.tight_layout(rect=(0, 0.14, 1, 1))
+    return fig
+
+
+def plot_compare_paired(df, panels, plt):
+    """Every video against its twin: original score (x) and fine-tuned score (y). Above the diagonal = the fine-tuning
+    made the video closer to its training clip."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.2))
+    for ax, (column, title, threshold, _) in zip(axes, panels):
+        both = df.dropna(subset=[f"{column}_original", f"{column}_finetuned"])  # the filter can leave no window
+        low = min(-0.1, both[[f"{column}_original", f"{column}_finetuned"]].min().min() - 0.05)
+        ax.plot([low, 1.03], [low, 1.03], color=MUTED, linewidth=1.2, label="No change")
+        ax.axvline(threshold, color=MUTED, linestyle="--", linewidth=1.2)
+        ax.axhline(threshold, color=MUTED, linestyle="--", linewidth=1.2, label="Threshold of the paper")
+        counts = []
+        for role, color, label in [("background", BACKGROUND_COLOR, "Background"), ("memorized", MEMORIZED_COLOR, "Memorized")]:
+            rows = both[both["role"] == role]
+            ax.scatter(rows[f"{column}_original"], rows[f"{column}_finetuned"], s=30, color=color, edgecolors="white",
+                       linewidths=0.6, label=label)
+            up = (rows[f"{column}_finetuned"] > rows[f"{column}_original"]).sum()
+            counts.append(f"{label} {up}/{len(rows)}")
+        ax.set_xlim(low, 1.03)
+        ax.set_ylim(low, 1.03)
+        ax.set_aspect("equal")
+        ax.set_title(title, loc="left")
+        # How many videos lie above the diagonal (only videos with a score from both models are drawn and counted).
+        ax.set_xlabel(f"Original model\nHigher after fine-tuning:\n{counts[1]} · {counts[0]}")
+    axes[0].set_ylabel("Fine-tuned model")
+    legend_below(fig, axes[0])
+    return fig
+
+
+def plot_compare_distributions(df, panels, plt):
+    """How the scores are spread, original (gray) against fine-tuned (colored): memorized samples on top, background below."""
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7.6), sharex="col")
+    bins = np.arange(-1, 1.0001, 0.05)
+    for r, (role, color, name) in enumerate([("memorized", MEMORIZED_COLOR, "Memorized samples"),
+                                             ("background", BACKGROUND_COLOR, "Background samples")]):
+        for ax, (column, title, threshold, _) in zip(axes[r], panels):
+            rows = df[df["role"] == role]
+            n = []
+            for model, label in MODELS:
+                c = ORIGINAL_COLOR if model == "original" else color
+                values = rows[f"{column}_{model}"].dropna()
+                ax.hist(values, bins=bins, histtype="step", linewidth=2, color=c,
+                        label=label if model == "original" else f"{label}, {role} samples")
+                ax.hist(values, bins=bins, color=c, alpha=0.15)
+                n.append(len(values))
+            ax.axvline(threshold, color=MUTED, linestyle="--", linewidth=1.2, label="Threshold of the paper")
+            ax.set_title(f"{name} · {title}", loc="left", fontsize=12.5)
+            ax.set_xlim(max(-1, df[[f"{column}_original", f"{column}_finetuned"]].min().min() - 0.05), 1)
+            ax.set_xlabel(f"Score (n = {n[0]} original, {n[1]} fine-tuned)", fontsize=11)
+        axes[r][0].set_ylabel("Videos")
+    # One legend below: gray, blue, orange, the threshold.
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    more, more_labels = axes[1][0].get_legend_handles_labels()
+    order = [(handles[0], labels[0]), (handles[1], labels[1]), (more[1], more_labels[1]), (handles[2], labels[2])]
+    fig.legend(*zip(*order), frameon=False, ncol=4, loc="lower center", fontsize=11)
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    return fig
+
+
+def compare_summary(df, panels, groups):
+    """Per group and metric: both models' mean and share of memorized videos, the mean change, and whether the change
+    is larger than chance (Wilcoxon signed-rank test on the twins)."""
+    from scipy.stats import wilcoxon
+    rows = []
+    for name, members in groups_of(df, groups):
+        for column, title, _, above in panels:
+            pair = df.loc[members, [f"{column}_original", f"{column}_finetuned"]].dropna()
+            o, f = pair[f"{column}_original"], pair[f"{column}_finetuned"]
+            rows.append({"group": name.replace("\n", " "), "metric": column, "videos": len(pair),
+                         "original_mean": o.mean(), "finetuned_mean": f.mean(), "mean_change": (f - o).mean(),
+                         "original_memorized_%": 100 * above(o).mean(), "finetuned_memorized_%": 100 * above(f).mean(),
+                         "higher_after_finetuning": int((f > o).sum()),
+                         "wilcoxon_p": wilcoxon(f, o).pvalue if len(pair) >= 6 else np.nan})
+    return pd.DataFrame(rows)
+
+
+def run_compare(args):
+    """Figures and a table of the fine-tuned model against the original model, in --save-to."""
+    plt = pyplot()
+    df = paired_metrics(args)
+    columns = metric_panels(read_metrics(args.finetuned), args)
+    # A panel's test takes the scores of either model; here it is only the threshold, as in the other figures.
+    panels = [(column, title, threshold, (lambda v, t=threshold, c=column: v >= t if c == "gsscd" else v > t))
+              for column, title, threshold, _ in columns]
+    os.makedirs(args.save_to, exist_ok=True)
+    df.to_csv(os.path.join(args.save_to, "paired_metrics.csv"), index=False, float_format="%.4f")
+    summary = compare_summary(df, panels, args.groups)
+    summary.to_csv(os.path.join(args.save_to, "compare_summary.csv"), index=False, float_format="%.4g")
+    with pd.option_context("display.width", 250, "display.max_columns", None, "display.max_rows", None):
+        print(summary.round(3).to_string(index=False))
+    figures = {"compare_share_memorized": plot_compare_share(df, panels, args.groups, plt),
+               "compare_score_vs_copies": plot_compare_copies(df, panels, plt),
+               "compare_paired": plot_compare_paired(df, panels, plt),
+               "compare_distributions": plot_compare_distributions(df, panels, plt)}
+    save_figures(figures, args.save_to, None, plt)
+    print(f"-> {args.save_to}: paired_metrics.csv, compare_summary.csv")
 
 
 def main():
@@ -329,9 +527,18 @@ def main():
     f.add_argument("--gsscd-threshold", type=float, default=0.4, help="line in the figures, and what counts as memorized")
     f.add_argument("--ofs-threshold", type=float, default=0.5, help="line in the figures, and what counts as memorized")
     f.add_argument("--groups", type=int, default=5, help="groups of copies in share_memorized")
+    f.add_argument("--title", default=None, help='written above every figure, e.g. "Fine-tuned model"')
+
+    c = sub.add_parser("compare", help="figures of the fine-tuned model against the original model, same prompts")
+    c.add_argument("--finetuned", default="outputs/finetune_eval", help="folder with metrics.csv of the fine-tuned model")
+    c.add_argument("--original", default="outputs/finetune_eval_original", help="folder with metrics.csv of the original model")
+    c.add_argument("--save-to", default="outputs/finetune_compare", help="folder of the figures and tables")
+    c.add_argument("--gsscd-threshold", type=float, default=0.4, help="line in the figures, and what counts as memorized")
+    c.add_argument("--ofs-threshold", type=float, default=0.5, help="line in the figures, and what counts as memorized")
+    c.add_argument("--groups", type=int, default=5, help="groups of copies")
 
     args = parser.parse_args()
-    {"prompts": run_prompts, "metrics": run_metrics, "plot": run_plot}[args.command](args)
+    {"prompts": run_prompts, "metrics": run_metrics, "plot": run_plot, "compare": run_compare}[args.command](args)
 
 
 if __name__ == "__main__":
