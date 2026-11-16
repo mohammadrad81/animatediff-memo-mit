@@ -8,6 +8,11 @@ Steps:
   python memorization_eval.py plot        figures of the results
   python memorization_eval.py compare     figures of the fine-tuned model against the original model (same prompts)
 
+Mitigation methods on the fine-tuned model (the same captions, generated with --experiments guard,soften,clip,noise,sail):
+  python memorization_eval.py metrics --experiments guard,soften,clip,noise,sail
+  python memorization_eval.py plot --experiment guard          (and the other methods)
+  python memorization_eval.py mitigation  figures of all the methods against no mitigation and the original model
+
 Both metrics are from Chen et al., "Investigating Memorization in Video Diffusion Models". Every generated video is
 compared with the exact clip it was fine-tuned on: the 16 frames of finetune.py's read_clip, center-cropped.
 """
@@ -115,54 +120,85 @@ def summarize(df, by, ofs):
         ofs_nmf_median=(f"{ofs}_nmf", "median"), ofs_nmf_memorized=(f"{ofs}_nmf_memorized", "mean"))
 
 
+# The experiments of `main.py batch`: the plain videos (normal) and the five mitigation methods. Each one's videos are
+# in <out>/<experiment>/, all made from the same captions and the same starting noise (seed).
+EXPERIMENTS = {"normal": "No mitigation", "guard": "GUARD", "soften": "Softened attention", "clip": "CLIP embeddings",
+               "noise": "Initial-noise adjustment", "sail": "SAIL"}
+
+
+def result_file(folder, name, experiment="normal"):
+    """The plain videos keep the names of the first evaluation (metrics.csv, ...); a mitigation adds its name
+    (metrics_guard.csv, ...)."""
+    stem, extension = os.path.splitext(name)
+    return os.path.join(folder, name if experiment == "normal" else f"{stem}_{experiment}{extension}")
+
+
+def experiment_list(text):
+    experiments = text.split(",")
+    unknown = set(experiments) - set(EXPERIMENTS)
+    if unknown:
+        raise SystemExit(f"unknown experiment {', '.join(sorted(unknown))}: use any of {','.join(EXPERIMENTS)}")
+    return experiments
+
+
 def run_metrics(args):
-    """GSSCD and OFS-k of every generated video against its training clip -> metrics.csv, summary_role.csv and
-    summary_copies.csv in --out."""
+    """GSSCD and OFS-k of every generated video against its training clip, for each experiment -> metrics.csv,
+    summary_role.csv and summary_copies.csv in --out (with the experiment's name added, except for normal)."""
     if not 1 <= args.k <= 15:
         raise SystemExit("--k must be between 1 and 15: 16 frames have 15 flows")
+    experiments = experiment_list(args.experiments)
+    if args.videos and len(experiments) > 1:
+        raise SystemExit("--videos works with one experiment only; without it, <out>/<experiment>/ is used")
     sheet = pd.read_csv(os.path.join(args.out, "prompts.csv"), keep_default_na=False).rename(columns={"index": "videoid"})
-    gif = lambda v: os.path.join(args.videos, f"{v}.gif")
-    missing = [v for v in sheet["videoid"] if not os.path.exists(gif(v))]
-    if missing:  # averages over part of the videos could not be compared
-        raise SystemExit(f"{len(missing)} of {len(sheet)} videos are not generated yet in {args.videos}")
+    folder = lambda experiment: args.videos or os.path.join(args.out, experiment)
+    gif = lambda experiment, v: os.path.join(folder(experiment), f"{v}.gif")
+    for experiment in experiments:  # averages over part of the videos could not be compared
+        missing = [v for v in sheet["videoid"] if not os.path.exists(gif(experiment, v))]
+        if missing:
+            raise SystemExit(f"{experiment}: {len(missing)} of {len(sheet)} videos are not generated yet in {folder(experiment)}")
 
     sscd = load_sscd(args.sscd_weights if os.path.exists(args.sscd_weights) else None)
     raft = raft_large(weights=Raft_Large_Weights.DEFAULT).cuda().eval()
 
     ofs = f"ofs_{args.k}"
-    rows = []
+    rows = {experiment: [] for experiment in experiments}
     for row in tqdm(sheet.itertuples(), total=len(sheet), desc="metrics"):
-        generated = gif_frames(gif(row.videoid))
+        # The training clip is the same for every experiment: its SSCD embeddings and flows are computed once.
         training = read_clip(video_path(args, row.videoid))
-
-        # GSSCD (Eq. 2): the largest SSCD cosine similarity over all the pairs of frames.
-        g = embed(sscd, square(generated, SSCD_SIZE, crop=False)).float()
         t = embed(sscd, square(training, SSCD_SIZE, crop=True)).float()
-        gsscd = (g @ t.T).max().item()
-
-        # OFS-k, without and with the natural motion filter (the paper reports both).
-        fg = optical_flow(raft, square(generated, FLOW_SIZE, crop=False))
         ft = optical_flow(raft, square(training, FLOW_SIZE, crop=True))
-        S = flow_similarity(fg, ft)
-        filtered = ofs_k(S, args.k, natural_motion(fg, args.min_magnitude, args.min_entropy),
-                         natural_motion(ft, args.min_magnitude, args.min_entropy))
+        ignored_training = natural_motion(ft, args.min_magnitude, args.min_entropy)
 
-        rows.append({"videoid": row.videoid, "role": row.role, "copies": row.copies, "caption": row.caption,
-                     "gsscd": gsscd, ofs: ofs_k(S, args.k), f"{ofs}_nmf": filtered})
+        for experiment in experiments:
+            generated = gif_frames(gif(experiment, row.videoid))
 
-    df = pd.DataFrame(rows)
-    df["gsscd_memorized"] = df["gsscd"] >= args.gsscd_threshold
-    df[f"{ofs}_memorized"] = df[ofs] > args.ofs_threshold
-    df[f"{ofs}_nmf_memorized"] = df[f"{ofs}_nmf"] > args.ofs_threshold  # a video with no window left counts as False
+            # GSSCD (Eq. 2): the largest SSCD cosine similarity over all the pairs of frames.
+            g = embed(sscd, square(generated, SSCD_SIZE, crop=False)).float()
+            gsscd = (g @ t.T).max().item()
 
-    df.to_csv(os.path.join(args.out, "metrics.csv"), index=False, float_format="%.4f")
-    by_role = summarize(df, "role", ofs)
-    by_copies = summarize(df[df["role"] == "memorized"], "copies", ofs)  # does memorization grow with the copies?
-    by_role.to_csv(os.path.join(args.out, "summary_role.csv"), float_format="%.4f")
-    by_copies.to_csv(os.path.join(args.out, "summary_copies.csv"), float_format="%.4f")
-    with pd.option_context("display.width", 250, "display.max_columns", None, "display.max_rows", None):
-        print(by_role.round(3), "\n", by_copies.round(3))
-    print(f"-> {args.out}: metrics.csv, summary_role.csv, summary_copies.csv")
+            # OFS-k, without and with the natural motion filter (the paper reports both).
+            fg = optical_flow(raft, square(generated, FLOW_SIZE, crop=False))
+            S = flow_similarity(fg, ft)
+            filtered = ofs_k(S, args.k, natural_motion(fg, args.min_magnitude, args.min_entropy), ignored_training)
+
+            rows[experiment].append({"videoid": row.videoid, "role": row.role, "copies": row.copies,
+                                     "caption": row.caption, "gsscd": gsscd, ofs: ofs_k(S, args.k), f"{ofs}_nmf": filtered})
+
+    for experiment in experiments:
+        df = pd.DataFrame(rows[experiment])
+        df["gsscd_memorized"] = df["gsscd"] >= args.gsscd_threshold
+        df[f"{ofs}_memorized"] = df[ofs] > args.ofs_threshold
+        df[f"{ofs}_nmf_memorized"] = df[f"{ofs}_nmf"] > args.ofs_threshold  # a video with no window left counts as False
+
+        files = [result_file(args.out, name, experiment) for name in ["metrics.csv", "summary_role.csv", "summary_copies.csv"]]
+        df.to_csv(files[0], index=False, float_format="%.4f")
+        by_role = summarize(df, "role", ofs)
+        by_copies = summarize(df[df["role"] == "memorized"], "copies", ofs)  # does memorization grow with the copies?
+        by_role.to_csv(files[1], float_format="%.4f")
+        by_copies.to_csv(files[2], float_format="%.4f")
+        with pd.option_context("display.width", 250, "display.max_columns", None):
+            print(f"\n{EXPERIMENTS[experiment]}\n{by_role.round(3)}")
+        print(f"-> {', '.join(files)}")
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -294,8 +330,11 @@ def pyplot():
     return plt
 
 
-def read_metrics(folder):
-    return pd.read_csv(os.path.join(folder, "metrics.csv"), keep_default_na=False, na_values=[""])
+def read_metrics(folder, experiment="normal"):
+    path = result_file(folder, "metrics.csv", experiment)
+    if not os.path.exists(path):
+        raise SystemExit(f"{path} is missing: run `memorization_eval.py --out {folder} metrics --experiments {experiment}` first")
+    return pd.read_csv(path, keep_default_na=False, na_values=[""])
 
 
 def save_figures(figures, folder, title, plt):
@@ -311,13 +350,21 @@ def save_figures(figures, folder, title, plt):
 
 
 def run_plot(args):
-    """Figures of metrics.csv for presenting, in <--out>/plots."""
+    """Figures of one experiment's metrics for presenting, in <--out>/plots (normal) or <--out>/plots_<experiment>."""
     plt = pyplot()
-    df = read_metrics(args.out)
+    df = read_metrics(args.out, args.experiment)
     panels = metric_panels(df, args)
     figures = {"distributions": plot_distributions(df, panels, plt), "score_vs_copies": plot_copies(df, panels, plt),
                "share_memorized": plot_share(df, panels, args.groups, plt), "content_vs_motion": plot_content_vs_motion(df, panels, plt)}
-    save_figures(figures, os.path.join(args.out, "plots"), args.title, plt)
+    title = args.title or (None if args.experiment == "normal" else f"Fine-tuned model with {EXPERIMENTS[args.experiment]}")
+    folder = os.path.join(args.out, "plots" if args.experiment == "normal" else f"plots_{args.experiment}")
+    save_figures(figures, folder, title, plt)
+
+
+def threshold_panels(df, args):
+    """metric_panels, with a test that takes any column of scores instead of the mask of one table."""
+    return [(column, title, threshold, (lambda v, t=threshold, c=column: v >= t if c == "gsscd" else v > t))
+            for column, title, threshold, _ in metric_panels(df, args)]
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -483,10 +530,7 @@ def run_compare(args):
     """Figures and a table of the fine-tuned model against the original model, in --save-to."""
     plt = pyplot()
     df = paired_metrics(args)
-    columns = metric_panels(read_metrics(args.finetuned), args)
-    # A panel's test takes the scores of either model; here it is only the threshold, as in the other figures.
-    panels = [(column, title, threshold, (lambda v, t=threshold, c=column: v >= t if c == "gsscd" else v > t))
-              for column, title, threshold, _ in columns]
+    panels = threshold_panels(read_metrics(args.finetuned), args)  # the test takes the scores of either model
     os.makedirs(args.save_to, exist_ok=True)
     df.to_csv(os.path.join(args.save_to, "paired_metrics.csv"), index=False, float_format="%.4f")
     summary = compare_summary(df, panels, args.groups)
@@ -501,6 +545,135 @@ def run_compare(args):
     print(f"-> {args.save_to}: paired_metrics.csv, compare_summary.csv")
 
 
+# ------------------------------------------------------------------------------------------------------------------
+# Part 5: the mitigation methods on the fine-tuned model
+# ------------------------------------------------------------------------------------------------------------------
+# A method works if the memorized samples are copied less than without mitigation (normal), ideally as little as by the
+# original model, which never saw the duplicates. Every method generates each caption from the same starting noise as
+# normal, so each video is compared with its own twin without mitigation.
+
+NO_MITIGATION_COLOR = "#52514e"
+
+
+def mitigation_scores(args):
+    """{name: metrics table}, all in the order of the videos of normal: the experiments, then "original" if found."""
+    tables = {experiment: read_metrics(args.out, experiment) for experiment in experiment_list(args.experiments)}
+    if "normal" not in tables:
+        raise SystemExit("--experiments must include normal: the methods are compared with it")
+    if args.original and os.path.exists(os.path.join(args.original, "metrics.csv")):
+        tables["original"] = read_metrics(args.original)
+    order = tables["normal"]["videoid"]
+    for name, table in tables.items():
+        if set(table["videoid"]) != set(order):
+            raise SystemExit(f"{name} has other videos than normal: generate every experiment from the same prompts.csv")
+        tables[name] = table.set_index("videoid").loc[order].reset_index()
+    return tables
+
+
+def label_of(name):
+    """Name under a bar, on two lines if it is long."""
+    return "Original model\n(reference)" if name == "original" else EXPERIMENTS[name].replace(" ", "\n", 1)
+
+
+def mitigation_summary(tables, panels, groups):
+    """Per method, group and metric: the mean, the share of videos counted as memorized, the change against normal
+    (mean change of the twins, Wilcoxon signed-rank p-value), and how many of the videos memorized without mitigation
+    are still memorized with the method."""
+    from scipy.stats import wilcoxon
+    normal, rows = tables["normal"], []
+    for name, table in tables.items():
+        for group, members in groups_of(normal, groups):
+            for column, _, _, above in panels:
+                values, before = table.loc[members, column], normal.loc[members, column]
+                pair = pd.DataFrame({"before": before, "after": values}).dropna()
+                change = pair["after"] - pair["before"]
+                was = above(before)
+                rows.append({"method": name, "group": group.replace("\n", " "), "metric": column,
+                             "videos_with_score": int(values.notna().sum()), "mean": values.mean(),
+                             "memorized_%": 100 * above(values).mean(),
+                             "mean_change_vs_normal": change.mean() if name != "normal" else np.nan,
+                             "wilcoxon_p_vs_normal": (wilcoxon(pair["after"], pair["before"]).pvalue
+                                                      if name != "normal" and len(pair) >= 6 and change.any() else np.nan),
+                             "memorized_without_mitigation": int(was.sum()),
+                             "still_memorized": int((was & above(values)).sum())})
+    return pd.DataFrame(rows)
+
+
+def plot_mitigation_share(tables, panels, plt):
+    """The share of videos counted as memorized for every method: memorized samples (blue) and background (orange)."""
+    names = list(tables)
+    x = np.arange(len(names))
+    roles = tables["normal"]["role"]
+    fig, axes = plt.subplots(len(panels), 1, figsize=(max(9, 1.6 * len(names)), 4.1 * len(panels)), sharex=True)
+    for ax, (column, title, _, above) in zip(axes, panels):
+        for offset, role, color, label in [(-0.19, "memorized", MEMORIZED_COLOR, "Memorized samples (2–51 copies)"),
+                                           (0.19, "background", BACKGROUND_COLOR, "Background samples (1 copy)")]:
+            shares = [100 * above(tables[n][column])[roles == role].mean() for n in names]
+            bars = ax.bar(x + offset, shares, width=0.36, color=color, label=label)
+            ax.bar_label(bars, labels=[f"{s:.0f}%" for s in shares], padding=2, fontsize=10, color=INK)
+        if "original" in tables:  # the reference is not a method: set it apart
+            ax.axvline(len(names) - 1.5, color=GRID, linewidth=1.5)
+        ax.set_title(title, loc="left")
+        ax.set_ylabel("Counted as memorized (%)")
+        ax.set_ylim(0, 112)
+        ax.grid(False, axis="x")
+    axes[-1].set_xticks(x, [label_of(n) for n in names], fontsize=11)
+    legend_below(fig, axes[0])
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    return fig
+
+
+def plot_mitigation_copies(tables, panels, plt):
+    """One panel per method and metric: the mean score against the copies, for the method (blue), no mitigation (dark
+    gray) and the original model (light gray). Below no mitigation = the method lowers the copying."""
+    methods = [n for n in tables if n not in ("normal", "original")]
+    panels = panels[:2]  # with the filter, too few videos have a score for a trend per number of copies
+    memorized = tables["normal"]["role"] == "memorized"
+    copies = tables["normal"]["copies"][memorized]
+    levels = np.sort(copies.unique())
+    fig, axes = plt.subplots(len(panels), len(methods), figsize=(3.6 * len(methods) + 1, 3.9 * len(panels)),
+                             sharex=True, sharey="row", squeeze=False)
+    lines = [("original", ORIGINAL_COLOR, "Original model (never saw the duplicates)"),
+             ("normal", NO_MITIGATION_COLOR, "Fine-tuned, no mitigation")]
+    for c, method in enumerate(methods):
+        for r, (column, title, threshold, _) in enumerate(panels):
+            ax = axes[r][c]
+            for name, color, label in lines + [(method, MEMORIZED_COLOR, "Fine-tuned, with the method of the panel")]:
+                if name not in tables:
+                    continue
+                # The mean of 5 neighbouring numbers of copies, as in score_vs_copies.
+                trend = (tables[name][column][memorized].groupby(copies).mean().reindex(levels)
+                         .rolling(5, center=True, min_periods=1).mean())
+                ax.plot(levels, trend, color=color, linewidth=2.5 if name == method else 2, label=label)
+            ax.axhline(threshold, color=MUTED, linestyle="--", linewidth=1.2, label="Threshold of the paper")
+            ax.set_title(f"{EXPERIMENTS[method]} · {title.split(' (')[0]}", loc="left", fontsize=12.5)
+            if r == len(panels) - 1:
+                ax.set_xlabel("Copies in the fine-tuning dataset")
+        for r, (_, title, _, _) in enumerate(panels):
+            axes[r][0].set_ylabel(f"Mean {title.split(' (')[0]}")
+    legend_below(fig, axes[0][0])
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    return fig
+
+
+def run_mitigation(args):
+    """Figures and a table of every mitigation method against no mitigation (and the original model), in --save-to."""
+    plt = pyplot()
+    tables = mitigation_scores(args)
+    panels = threshold_panels(tables["normal"], args)
+    os.makedirs(args.save_to, exist_ok=True)
+    summary = mitigation_summary(tables, panels, args.groups)
+    summary.to_csv(os.path.join(args.save_to, "mitigation_summary.csv"), index=False, float_format="%.4g")
+    main_rows = summary[summary["group"].isin(["Background (1 copy)", "All memorized"])]
+    with pd.option_context("display.width", 250, "display.max_columns", None, "display.max_rows", None):
+        print(main_rows.round(3).to_string(index=False))
+    figures = {"mitigation_share_memorized": plot_mitigation_share(tables, panels, plt)}
+    if len([n for n in tables if n not in ("normal", "original")]):
+        figures["mitigation_score_vs_copies"] = plot_mitigation_copies(tables, panels, plt)
+    save_figures(figures, args.save_to, None, plt)
+    print(f"-> {args.save_to}: mitigation_summary.csv")
+
+
 def main():
     parser = argparse.ArgumentParser(description="GSSCD and OFS-k of videos generated by the fine-tuned model")
     parser.add_argument("--root", default="data/webvid", help="the WebVid folder of webvid.py (where the videos are)")
@@ -512,7 +685,9 @@ def main():
     p.add_argument("--seed", type=int, default=0, help="which background samples are drawn")
 
     m = sub.add_parser("metrics", help="GSSCD and OFS-k of the generated videos")
-    m.add_argument("--videos", default="outputs/finetune_eval/normal", help="folder of the generated <videoid>.gif")
+    m.add_argument("--experiments", default="normal",
+                   help=f"experiments of `main.py batch` to measure, any of {','.join(EXPERIMENTS)}; videos in <out>/<experiment>/")
+    m.add_argument("--videos", default=None, help="another folder of the generated <videoid>.gif (one experiment only)")
     m.add_argument("--k", type=int, default=3, help="flows per window of OFS-k (the paper's best: 3)")
     m.add_argument("--gsscd-threshold", type=float, default=0.4, help="GSSCD from which content is memorized (paper: 0.4)")
     m.add_argument("--ofs-threshold", type=float, default=0.5, help="OFS-k above which motion is memorized (paper: 0.5)")
@@ -528,6 +703,8 @@ def main():
     f.add_argument("--ofs-threshold", type=float, default=0.5, help="line in the figures, and what counts as memorized")
     f.add_argument("--groups", type=int, default=5, help="groups of copies in share_memorized")
     f.add_argument("--title", default=None, help='written above every figure, e.g. "Fine-tuned model"')
+    f.add_argument("--experiment", default="normal", choices=list(EXPERIMENTS),
+                   help="whose metrics to draw; figures in <out>/plots (normal) or <out>/plots_<experiment>")
 
     c = sub.add_parser("compare", help="figures of the fine-tuned model against the original model, same prompts")
     c.add_argument("--finetuned", default="outputs/finetune_eval", help="folder with metrics.csv of the fine-tuned model")
@@ -537,8 +714,19 @@ def main():
     c.add_argument("--ofs-threshold", type=float, default=0.5, help="line in the figures, and what counts as memorized")
     c.add_argument("--groups", type=int, default=5, help="groups of copies")
 
+    g = sub.add_parser("mitigation", help="figures of the mitigation methods against no mitigation, same prompts")
+    g.add_argument("--experiments", default=",".join(EXPERIMENTS),
+                   help="experiments to compare (metrics in --out), normal included")
+    g.add_argument("--original", default="outputs/finetune_eval_original",
+                   help="folder with metrics.csv of the original model, drawn as the reference if it exists ('' = none)")
+    g.add_argument("--save-to", default="outputs/finetune_mitigation", help="folder of the figures and the table")
+    g.add_argument("--gsscd-threshold", type=float, default=0.4, help="line in the figures, and what counts as memorized")
+    g.add_argument("--ofs-threshold", type=float, default=0.5, help="line in the figures, and what counts as memorized")
+    g.add_argument("--groups", type=int, default=5, help="groups of copies in the table")
+
     args = parser.parse_args()
-    {"prompts": run_prompts, "metrics": run_metrics, "plot": run_plot, "compare": run_compare}[args.command](args)
+    {"prompts": run_prompts, "metrics": run_metrics, "plot": run_plot, "compare": run_compare,
+     "mitigation": run_mitigation}[args.command](args)
 
 
 if __name__ == "__main__":

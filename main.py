@@ -299,8 +299,12 @@ def run_batch(args, pipe):
                            if k not in PATHS and k in old and settings.get(k) != old.get(k))
         if changed:
             raise SystemExit(f"{args.out} was made with other settings ({changed}); use another --out")
-    with open(settings_path, "w") as f:
+    # Written under another name first, then renamed: with --shard, several processes start at the same time, and one
+    # could otherwise read the file while another is writing it (empty file -> JSONDecodeError).
+    tmp = f"{settings_path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
         json.dump(settings, f, indent=2)
+    os.replace(tmp, settings_path)
 
     layers = soften_layers(args, pipe.unet) if "soften" in experiments else ()
     for name in experiments:

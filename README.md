@@ -1079,6 +1079,113 @@ orange background):
 
 With the filter, a video is compared only where both models' videos have a window left, so those numbers cover fewer videos.
 
+**7. The mitigation methods on the fine-tuned model.** Generate the same 400 captions (200 memorized, 200 background) with
+each mitigation method of sections 2–6 (`guard`, `soften`, `clip`, `noise`, `sail`), using the fine-tuned model, then measure
+GSSCD and OFS-k of every video against its training clip, as in step 5.
+
+Generate into **the same folder as step 5**, `outputs/finetune_eval`. Its `normal/` videos are then the "no mitigation"
+reference, and every method starts each caption from the same noise (seed 0) as its `normal` video. Each method writes to
+its own subfolder (`outputs/finetune_eval/guard/`, ...). The other options must stay as in step 5 (`--height 256 --width 256`,
+same `--model`): `batch` refuses a folder made with other settings.
+
+```bash
+for k in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$k nohup python main.py --model outputs/finetune/final batch \
+      --csv outputs/finetune_eval/prompts.csv --out outputs/finetune_eval --experiments guard,soften,clip,noise,sail \
+      --height 256 --width 256 --shard $k/4 > outputs/finetune_mitigation_$k.log 2>&1 &
+done
+tail -f outputs/finetune_mitigation_0.log      # progress: "[n/100] <method>: index ..."; Ctrl+C stops only the tail
+```
+
+Every GPU goes through its 100 captions and makes the five videos of each caption before the next. `noise` and `sail`
+optimize the starting noise through the UNet, so they take much longer than the other three (I have not timed them at
+256×256). A stopped run can be started again with the same command; videos that exist are skipped. To run the methods
+one after another instead, give one method to `--experiments` at a time.
+
+Then, once all the videos exist (it refuses otherwise):
+
+```bash
+python memorization_eval.py metrics --experiments guard,soften,clip,noise,sail       # about 5× as long as step 5
+for m in guard soften clip noise sail; do python memorization_eval.py plot --experiment $m; done
+python memorization_eval.py mitigation                                              # writes outputs/finetune_mitigation/
+```
+
+`metrics --experiments` reads `<out>/<method>/` and writes, next to the files of step 5, `metrics_<method>.csv`,
+`summary_role_<method>.csv` and `summary_copies_<method>.csv` (`normal` keeps the names `metrics.csv`, ...). Each training
+clip is read and measured once for all the methods. `plot --experiment <method>` draws the four figures of step 5 for one
+method in `outputs/finetune_eval/plots_<method>/`.
+
+`mitigation` puts all the methods together (options `--experiments`, `--original`, `--save-to`, `--groups`, the thresholds). It
+draws the original model too, as the reference, if `outputs/finetune_eval_original/metrics.csv` exists (`--original ''` to leave
+it out). A method works if the memorized samples are copied less than without mitigation, ideally as rarely as by the
+original model, which never saw the duplicates.
+
+| file | shows |
+|---|---|
+| `mitigation_share_memorized` | for every method, the share of the memorized samples (blue) and background samples (orange) above the threshold, one panel per metric |
+| `mitigation_score_vs_copies` | one panel per method and metric (GSSCD, OFS-k): the mean score against the copies with the method (blue), without mitigation (dark gray) and from the original model (light gray). The lower the blue line under the dark gray one, the more the method reduces the copying |
+| `mitigation_summary.csv` | per method, group and metric: the mean, the share above the threshold, the mean change against no mitigation and its Wilcoxon p-value (same caption and seed, so each video is compared with its own twin), `memorized_without_mitigation` (how many videos of the group are above the threshold without mitigation) and `still_memorized` (how many of those stay above it with the method) |
+
+**Things to keep in mind**
+- The methods run with their default settings (sections 2–6). Those were chosen on the original model at 512×512; the
+  fine-tuned model at 256×256 may need other strengths. `sail`'s default stopping threshold follows the latent size, so it
+  adapts to 256×256; `noise`'s `--target` does not. To try other settings, use another `--out`, and copy `prompts.csv`,
+  `normal/`, `metrics.csv`, `summary_role.csv` and `summary_copies.csv` of `outputs/finetune_eval` into it first, so that
+  no mitigation is the same reference.
+- A lower score is not the whole story: a method that turns every video into noise would also score low. Look at the
+  videos of each method (`outputs/finetune_eval/<method>/`) to see whether they still show what the caption asks for.
+- The background samples show the side effects: a method should change them little, since they were not memorized.
+- Step 8 measures the quality of the videos, to see what each method costs.
+
+**8. Video quality: FVD and ViCLIP similarity** (`quality_eval.py`). Less copying is only useful if the videos stay good.
+Two scores, for the same 400 videos of every experiment (no mitigation and each method), and optionally the original model:
+
+| score | measures | how | better |
+|---|---|---|---|
+| **FVD** (Unterthiner et al., 2018) | realism: do the videos look like real WebVid videos? | Fréchet distance between the I3D features (Kinetics-400, the 400 logits) of the generated videos and of real clips | lower |
+| **ViCLIP similarity** (InternVid, Wang et al., 2023) | does the video show its caption? | cosine similarity of the ViCLIP-L/14 features of the video (8 frames, 224×224) and of the caption | higher |
+
+```bash
+python quality_eval.py check-viclip     # once: ViCLIP must give the result of its official demo (printed next to it)
+python quality_eval.py reference        # once: the real clips (FVD reference and the real training clips)
+python quality_eval.py metrics --experiments normal,guard,soften,clip,noise,sail
+python quality_eval.py --out outputs/finetune_eval_original metrics --experiments normal     # optional: original model
+python quality_eval.py summary          # table and figures in outputs/finetune_quality/
+```
+
+`metrics` refuses to start while videos are missing. It writes, next to the videos' other results in `--out`,
+`quality.csv` (one row per video: `videoid, role, copies, caption, viclip`) and `i3d_features.npy` for no mitigation, and
+`quality_<method>.csv`, `i3d_features_<method>.npy` for the methods. `summary` reads them, and `metrics*.csv` of
+`memorization_eval.py` for the share of memorized samples still copied, and writes to `outputs/finetune_quality/`:
+
+| file | shows |
+|---|---|
+| `quality_summary.csv` | per row (real training clips, original model, no mitigation, each method) and group (all, memorized samples, background samples): `fvd`, `viclip_mean`, `viclip_std`, the change of ViCLIP against no mitigation with its Wilcoxon p-value (each video against its twin), and `memorized_copied_%` (GSSCD ≥ 0.4) |
+| `quality_scores` | FVD (top) and ViCLIP similarity (bottom) of every row, memorized samples (blue) and background samples (orange) |
+| `quality_vs_memorization` | the trade-off, memorized samples only: how many are still copied (x) against their ViCLIP (left) and FVD (right). The best methods are on the left with the quality of no mitigation; the dashed line is the quality of the real training clips |
+
+**What the real clips are.** `reference` reads two sets of real clips, prepared as for the fine-tuning (16 frames, every 4th,
+center square, 256×256):
+- **The FVD reference**: 2048 random background clips of the fine-tuning table (`--size`, `--seed`), but **not** the 400
+  evaluated ones. Against the evaluated videos' own training clips, a copy would get a better FVD: a memorizing model
+  would look the most realistic. Saved in `outputs/finetune_quality/fvd_reference.npz`.
+- **The training clips of the 400 captions**, scored like generated videos (row "Real training clips"): the best FVD and
+  ViCLIP that real videos get with the same number of videos.
+
+**Choices and limits**
+- **I3D:** the TorchScript I3D of StyleGAN-V (`data/webvid/models/fvd/i3d_torchscript.pt`, downloaded once and checked
+  against its SHA-256), the one most video generation papers use, so the numbers can be compared with theirs. `i3d.py` is
+  another port of I3D, used by `webvid.py` to find duplicated videos; it is not used for FVD.
+- **FVD with few videos is noisy and biased upwards.** Papers use thousands of videos; here a group has 200 (all 400 in
+  "All"). The real training clips of the memorized and of the background captions, 200 each, are about 590 apart. Compare rows of the same group with each other and with
+  the real training clips, and do not compare these numbers with FVDs of papers.
+- **ViCLIP:** `OpenGVLab/ViCLIP-L-14-hf`, fixed to one version. Its model code comes with the weights from Hugging Face and
+  runs with `trust_remote_code`; the version is pinned so that the code that runs is the code that was read. It needs
+  `einops`, `ftfy` and `timm` (`pip install einops ftfy timm`). ViCLIP reads at most 32 tokens, so the end of long captions
+  is ignored. The raw cosine similarities are small (about 0.2–0.3 for matching pairs); only differences between rows matter.
+- **ViCLIP is a caption score, not a memorization score**: a copied training video matches its caption well. Read it with
+  the memorization: a good method keeps ViCLIP near no mitigation while fewer videos are copied.
+
 #### Reproducibility
 
 Running `train` again from the start with the same `--seed` gives **exactly the same weights**, bit for bit (checked by comparing every
@@ -1124,7 +1231,8 @@ saves in its `--out` folder:
 | `sscd.py` | the SSCD copy-detection network (ResNet-50 + GeM), for the official `sscd_disc_mixup` weights; used by `webvid.py gsscd` |
 | `i3d.py` | the I3D network (Inception-I3D, RGB), for the Kinetics-400 weights of DeepMind's model converted to PyTorch |
 | `finetune.py` | artificial memorization (section 10): chooses the samples, assigns the copies, and fine-tunes the UNet (CLIP and the VAE stay frozen) |
-| `memorization_eval.py` | measures the artificial memorization (section 10): the captions of the memorized samples and as many background samples, then GSSCD and OFS-k of the generated videos, figures of the results, and the comparison with the original model |
+| `memorization_eval.py` | measures the artificial memorization (section 10): the captions of the memorized samples and as many background samples, then GSSCD and OFS-k of the generated videos, figures of the results, the comparison with the original model, and the comparison of the mitigation methods |
+| `quality_eval.py` | video quality of the same videos (section 10, step 8): FVD against real WebVid clips and ViCLIP similarity to the caption, for no mitigation, each mitigation method and the original model |
 | `webvid.py` | WebVid-10M: metadata, video download, I3D features, duplication ranking, the prompt sheet and GSSCD of generated videos (section 8) |
 | `main.py` | command line (`attention`, `guard`, `soften`, `clip`, `noise`, `sail`, `batch`, `compare`); `experiment()` builds the normal / guard / soften / clip / noise / sail setup that all commands share |
 | `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams); `embed_prompts` builds the text embeddings, including the `clip` mitigation; `adjust_noise` is the `noise` experiment, `sail` the `sail` experiment, `guidance_vjp` the memory-saving gradient both use |
