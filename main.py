@@ -37,7 +37,7 @@ def guard_args(p, r_flag="--r"):
 
 
 def soften_args(p, r_flag="--r"):
-    p.add_argument("--temperature", "-T", type=float, default=2.0,
+    p.add_argument("--temperature", "-T", type=float, default=1.2,
                    help="logits are divided by T before the softmax (> 1 = softer, 1 = no change, < 1 = sharper)")
     p.add_argument("--kinds", default="cross", help="kinds of attention layers to soften: cross,spatial,temporal")
     p.add_argument("--layers", default="down,mid",
@@ -262,9 +262,67 @@ def run_soften(args, pipe):
     print(f"done: {args.out}")
 
 
-EXPERIMENTS = ["normal", "guard", "soften", "clip", "noise", "sail"]
+# The options that change the videos of one experiment only. Every other option (model, size, seed, guidance, ...)
+# changes the videos of all of them.
+EXPERIMENT_SETTINGS = {
+    "normal": [],
+    "guard": ["guard_r", "alpha", "tau", "blocks", "ortho", "r_schedule"],
+    "soften": ["temperature", "kinds", "layers", "keep_sot", "soften_r", "r_schedule"],
+    "clip": ["clip_mode", "keep_eot", "mask_ratio"],
+    "noise": ["noise_mode", "rho", "gamma", "adj_iters", "lr", "target", "max_iters", "cfg_start"],
+    "sail": ["sail_thres", "sail_lr", "sail_alpha", "sail_steps", "sail_rounds"],
+}
+EXPERIMENTS = list(EXPERIMENT_SETTINGS)
+OWN_SETTINGS = {k for keys in EXPERIMENT_SETTINGS.values() for k in keys}
 NOT_SETTINGS = ["start", "end", "batch_size", "experiments", "shard"]  # args that do not change the generated videos
 PATHS = ["csv", "out"]  # stored in settings.json, but may change (moved folder, sheet split into files)
+
+
+def has_videos(folder):
+    return os.path.isdir(folder) and any(f.endswith(".gif") and not f.endswith(".tmp.gif") for f in os.listdir(folder))
+
+
+def check_settings(args, experiments):
+    """settings.json keeps the settings the videos in args.out were made with, so that a continued run cannot mix
+    videos made with different settings:
+      - the common settings (model, size, seed, guidance, ...) must always be the same: the methods are compared with
+        the normal videos of the same folder;
+      - the settings of one method (e.g. soften's temperature) only have to be the same if its folder already has
+        videos. To run a method again with other settings, move its videos away first (see README, section 10).
+    The file has a "common" part and one part per experiment. Older files (one flat dict, from before this was per
+    experiment) are read as: every experiment was made with those settings."""
+    path = os.path.join(args.out, "settings.json")
+    current = {k: v for k, v in vars(args).items() if k not in NOT_SETTINGS}
+    common = {k: v for k, v in current.items() if k not in OWN_SETTINGS}
+    own = {e: {k: current[k] for k in EXPERIMENT_SETTINGS[e]} for e in experiments}
+    stored = {"common": {}, "experiments": {}}
+    if os.path.exists(path):
+        with open(path) as f:
+            stored = json.load(f)
+        if "common" not in stored:  # older flat file
+            stored = {"common": {k: v for k, v in stored.items() if k not in OWN_SETTINGS},
+                      "experiments": {e: {k: stored[k] for k in keys if k in stored}
+                                      for e, keys in EXPERIMENT_SETTINGS.items()}}
+
+    def changes(new, old):  # options added later are missing from old files
+        return ", ".join(f"{k} {old[k]} -> {new[k]}" for k in new if k not in PATHS and k in old and new[k] != old[k])
+
+    changed = changes(common, stored["common"])
+    if changed:
+        raise SystemExit(f"{args.out} was made with other settings ({changed}); use another --out")
+    for e in experiments:
+        changed = changes(own[e], stored["experiments"].get(e, {}))
+        if changed and has_videos(os.path.join(args.out, e)):
+            raise SystemExit(f"{os.path.join(args.out, e)}/ has videos made with other {e} settings ({changed}). "
+                             f"To make new ones, move that folder away first (README, section 10), or use another --out")
+    stored["common"] = common
+    stored["experiments"].update(own)
+    # Written under another name first, then renamed: with --shard, several processes start at the same time, and one
+    # could otherwise read the file while another is writing it (empty file -> JSONDecodeError).
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(stored, f, indent=2)
+    os.replace(tmp, path)
 
 
 def run_batch(args, pipe):
@@ -289,22 +347,7 @@ def run_batch(args, pipe):
     if not set(experiments) <= set(EXPERIMENTS):
         raise SystemExit(f"--experiments must be a list of {','.join(EXPERIMENTS)}")
 
-    # The settings are kept next to the videos; continuing a run with other settings would mix experiments.
-    settings = {k: v for k, v in vars(args).items() if k not in NOT_SETTINGS}
-    settings_path = os.path.join(args.out, "settings.json")
-    if os.path.exists(settings_path):
-        with open(settings_path) as f:
-            old = json.load(f)
-        changed = ", ".join(k for k in settings.keys() | old.keys()  # options added later are missing from old files
-                           if k not in PATHS and k in old and settings.get(k) != old.get(k))
-        if changed:
-            raise SystemExit(f"{args.out} was made with other settings ({changed}); use another --out")
-    # Written under another name first, then renamed: with --shard, several processes start at the same time, and one
-    # could otherwise read the file while another is writing it (empty file -> JSONDecodeError).
-    tmp = f"{settings_path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as f:
-        json.dump(settings, f, indent=2)
-    os.replace(tmp, settings_path)
+    check_settings(args, experiments)  # continuing a run with other settings would mix experiments
 
     layers = soften_layers(args, pipe.unet) if "soften" in experiments else ()
     for name in experiments:

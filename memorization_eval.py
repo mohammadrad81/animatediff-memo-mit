@@ -34,6 +34,9 @@ from webvid import embed, gif_frames, square, video_path
 
 SSCD_SIZE = 288  # SSCD's evaluation size, as in `webvid.py gsscd`
 FLOW_SIZE = 256  # the size of the fine-tuning; RAFT needs a multiple of 8
+# The original model generated at 512x512, its own size (README section 10, step 6); at 256x256 it makes broken
+# patterns (outputs/finetune_eval_original), so that run is not used as the reference.
+ORIGINAL_DEFAULT = "outputs/finetune_eval_original512"
 
 
 # ------------------------------------------------------------------------------------------------------------------
@@ -708,7 +711,7 @@ def main():
 
     c = sub.add_parser("compare", help="figures of the fine-tuned model against the original model, same prompts")
     c.add_argument("--finetuned", default="outputs/finetune_eval", help="folder with metrics.csv of the fine-tuned model")
-    c.add_argument("--original", default="outputs/finetune_eval_original", help="folder with metrics.csv of the original model")
+    c.add_argument("--original", default=ORIGINAL_DEFAULT, help="folder with metrics.csv of the original model")
     c.add_argument("--save-to", default="outputs/finetune_compare", help="folder of the figures and tables")
     c.add_argument("--gsscd-threshold", type=float, default=0.4, help="line in the figures, and what counts as memorized")
     c.add_argument("--ofs-threshold", type=float, default=0.5, help="line in the figures, and what counts as memorized")
@@ -717,7 +720,7 @@ def main():
     g = sub.add_parser("mitigation", help="figures of the mitigation methods against no mitigation, same prompts")
     g.add_argument("--experiments", default=",".join(EXPERIMENTS),
                    help="experiments to compare (metrics in --out), normal included")
-    g.add_argument("--original", default="outputs/finetune_eval_original",
+    g.add_argument("--original", default=ORIGINAL_DEFAULT,
                    help="folder with metrics.csv of the original model, drawn as the reference if it exists ('' = none)")
     g.add_argument("--save-to", default="outputs/finetune_mitigation", help="folder of the figures and the table")
     g.add_argument("--gsscd-threshold", type=float, default=0.4, help="line in the figures, and what counts as memorized")

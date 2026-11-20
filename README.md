@@ -255,7 +255,10 @@ same factor, so spikes lose their dominance, but so does every other strong atte
 As in GUARD, only the prompt stream (stream 1) is changed. The unconditional stream keeps normal attention.
 
 ```bash
-# cross-attention of the down and mid blocks (the layers GUARD attenuates), T = 2, with the normal video for comparison
+# cross-attention of the down and mid blocks (the layers GUARD attenuates), default T = 1.2, with the normal video for comparison
+python main.py soften --prompt "Living in the Light with Ann Graham Lotz" --baseline
+
+# a stronger softening
 python main.py soften --prompt "Living in the Light with Ann Graham Lotz" -T 2 --baseline
 
 # only text tokens 1..76 are flattened; <sot> keeps its normal share of the attention
@@ -273,7 +276,7 @@ python main.py soften --prompt "..." -T 2 --r 2 --baseline
 
 | option | default | meaning |
 |---|---|---|
-| `--temperature`, `-T` | 2.0 | logits are divided by `T` before the softmax |
+| `--temperature`, `-T` | 1.2 | logits are divided by `T` before the softmax (until 2026-11-17 the default was 2.0) |
 | `--kinds` | `cross` | kinds of attention layers to soften: `cross`, `spatial`, `temporal` (comma separated) |
 | `--layers` | `down,mid` | prefixes of the layer names to soften (see below) |
 | `--keep-sot` | off | cross-attention only: keep the attention on `<sot>` and soften only tokens 1..76 |
@@ -567,10 +570,15 @@ CUDA_VISIBLE_DEVICES=1 python main.py batch --csv prompts.csv --out outputs/my_r
 Ctrl+C, time limit), run the same command again and it continues where it stopped. To regenerate a
 video, delete its GIF. You can also add an experiment later (run again with another `--experiments`).
 
-**Settings are fixed per folder.** The first run writes `settings.json`. A later run into the same
-folder with different generation settings (e.g. another `--alpha` or `-T`) stops with an error, so
-videos made with different settings are never mixed. Use a new `--out` for each setting. `--start`,
-`--end`, `--batch-size`, `--experiments` and the `--csv` / `--out` paths may change between runs.
+**Settings are fixed per folder.** The first run writes `settings.json`, with the common settings (`--model`,
+`--frames`, `--steps`, `--height`, `--width`, `--seed`, `--s`, `--fps`) and the settings of each experiment. A later run
+into the same folder stops with an error, so that videos made with different settings are never mixed, if
+- a common setting differs: use a new `--out`;
+- a setting of one experiment differs (e.g. `-T` for `soften`, `--alpha` for `guard`) **and** that experiment's folder
+  already has videos. To make that experiment again with the new settings, move its folder away first (the other
+  experiments are not touched); see section 10, step 7, "Running one method again with other settings".
+
+`--start`, `--end`, `--batch-size`, `--experiments`, `--shard` and the `--csv` / `--out` paths may change between runs.
 
 | option | default | meaning |
 |---|---|---|
@@ -580,7 +588,7 @@ videos made with different settings are never mixed. Use a new `--out` for each 
 | `--start`, `--end` | whole sheet | rows to run |
 | `--batch-size` | 1 | prompts generated together in one UNet pass (see below) |
 | `--guard-r`, `--alpha`, `--tau`, `--blocks` | 2.0, 0.3, 0.1, `down,mid` | GUARD settings, as in `guard` (`--guard-r` is `guard`'s `--r`) |
-| `-T`, `--kinds`, `--layers`, `--keep-sot`, `--soften-r` | 2.0, `cross`, `down,mid`, off, 0 | soften settings, as in `soften` (`--soften-r` is `soften`'s `--r`) |
+| `-T`, `--kinds`, `--layers`, `--keep-sot`, `--soften-r` | 1.2, `cross`, `down,mid`, off, 0 | soften settings, as in `soften` (`--soften-r` is `soften`'s `--r`) |
 | `--clip-mode`, `--keep-eot`, `--mask-ratio` | `pad`, off, 0.7 | clip settings, as in `clip` |
 | `--noise-mode`, `--lr`, `--target`, `--max-iters`, `--rho`, `--gamma`, `--adj-iters`, `--cfg-start` | as in `noise` | noise settings, as in `noise` (per-sample adds about 2 min per prompt) |
 | `--sail-thres`, `--sail-lr`, `--sail-alpha`, `--sail-steps`, `--sail-rounds` | as in `sail` | SAIL settings, as in `sail` (adds about 1–2 min per prompt) |
@@ -1086,7 +1094,9 @@ GSSCD and OFS-k of every video against its training clip, as in step 5.
 Generate into **the same folder as step 5**, `outputs/finetune_eval`. Its `normal/` videos are then the "no mitigation"
 reference, and every method starts each caption from the same noise (seed 0) as its `normal` video. Each method writes to
 its own subfolder (`outputs/finetune_eval/guard/`, ...). The other options must stay as in step 5 (`--height 256 --width 256`,
-same `--model`): `batch` refuses a folder made with other settings.
+same `--model`): `batch` refuses a folder made with other settings. The `soften` videos of this step were first made with
+`-T 2` (the default until 2026-11-17); see "Running one method again with other settings" below for how they were redone
+with the new default `-T 1.2`.
 
 ```bash
 for k in 0 1 2 3; do
@@ -1126,12 +1136,39 @@ original model, which never saw the duplicates.
 | `mitigation_score_vs_copies` | one panel per method and metric (GSSCD, OFS-k): the mean score against the copies with the method (blue), without mitigation (dark gray) and from the original model (light gray). The lower the blue line under the dark gray one, the more the method reduces the copying |
 | `mitigation_summary.csv` | per method, group and metric: the mean, the share above the threshold, the mean change against no mitigation and its Wilcoxon p-value (same caption and seed, so each video is compared with its own twin), `memorized_without_mitigation` (how many videos of the group are above the threshold without mitigation) and `still_memorized` (how many of those stay above it with the method) |
 
+**Running one method again with other settings** (example: `soften` with `-T 1.2` instead of 2). The other methods and
+`normal/` stay as they are; only the method's own files are moved to an archive folder, so the old results are kept and
+`batch` accepts the new settings (it refuses while `outputs/finetune_eval/soften/` still holds videos of another `-T`).
+
+```bash
+# 1. keep the T = 2 results: the videos, their measurements, and the summaries that include them
+mkdir outputs/finetune_eval_soften_T2
+mv outputs/finetune_eval/{soften,plots_soften,metrics_soften.csv,summary_role_soften.csv,summary_copies_soften.csv,quality_soften.csv,i3d_features_soften.npy} \
+   outputs/finetune_eval_soften_T2/
+cp -r outputs/finetune_mitigation outputs/finetune_mitigation_soften_T2
+cp -r outputs/finetune_quality outputs/finetune_quality_soften_T2
+
+# 2. the 400 soften videos with T = 1.2 (now the default, so -T can be left out), same model, size and batch size as before
+for k in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$k nohup python main.py --model outputs/finetune/final batch \
+      --csv outputs/finetune_eval/prompts.csv --out outputs/finetune_eval --experiments soften -T 1.2 \
+      --height 256 --width 256 --batch-size 5 --shard $k/4 > outputs/finetune_soften_T1.2_$k.log 2>&1 &
+done
+
+# 3. once all 400 exist: memorization (step 7) and quality (step 8) of the new videos, then the summaries of all methods
+python memorization_eval.py metrics --experiments soften
+python memorization_eval.py plot --experiment soften
+python memorization_eval.py mitigation
+python quality_eval.py metrics --experiments soften
+python quality_eval.py summary
+```
+
 **Things to keep in mind**
 - The methods run with their default settings (sections 2–6). Those were chosen on the original model at 512×512; the
   fine-tuned model at 256×256 may need other strengths. `sail`'s default stopping threshold follows the latent size, so it
-  adapts to 256×256; `noise`'s `--target` does not. To try other settings, use another `--out`, and copy `prompts.csv`,
-  `normal/`, `metrics.csv`, `summary_role.csv` and `summary_copies.csv` of `outputs/finetune_eval` into it first, so that
-  no mitigation is the same reference.
+  adapts to 256×256; `noise`'s `--target` does not. To try other settings, either run the method again in the same folder
+  (above), or use another `--out` and copy `prompts.csv`, `normal/`, `metrics.csv`, `summary_role.csv` and
+  `summary_copies.csv` of `outputs/finetune_eval` into it first, so that no mitigation is the same reference.
 - A lower score is not the whole story: a method that turns every video into noise would also score low. Look at the
   videos of each method (`outputs/finetune_eval/<method>/`) to see whether they still show what the caption asks for.
 - The background samples show the side effects: a method should change them little, since they were not memorized.

@@ -6,7 +6,7 @@ Steps:
   python quality_eval.py check-viclip     once: ViCLIP must reproduce the result of its official demo
   python quality_eval.py reference        real clips: the FVD reference, and the scores of the real training clips
   python quality_eval.py metrics --experiments normal,guard,soften,clip,noise,sail
-  python quality_eval.py --out outputs/finetune_eval_original metrics      (the original model, optional)
+  python quality_eval.py --out outputs/finetune_eval_original512 metrics   (the original model at 512x512, optional)
   python quality_eval.py summary          table and figures of all of them, in outputs/finetune_quality
 
 FVD (Unterthiner et al., 2018): the Frechet distance between the I3D features of the generated videos and of real
@@ -29,7 +29,7 @@ from tqdm import tqdm
 
 from finetune import read_clip
 from memorization_eval import (BACKGROUND_COLOR, EXPERIMENTS, GRID, INK, MEMORIZED_COLOR, MUTED, NO_MITIGATION_COLOR,
-                               ORIGINAL_COLOR, experiment_list, pyplot, result_file, save_figures)
+                               ORIGINAL_COLOR, ORIGINAL_DEFAULT, experiment_list, pyplot, result_file, save_figures)
 from webvid import gif_frames, square, video_path
 
 VIDEO_SIZE = 256  # the size of the fine-tuning and of the generated videos; the real clips are cropped and resized to it
@@ -395,7 +395,7 @@ def main():
 
     s = sub.add_parser("summary", help="FVD, ViCLIP and the memorization of every method: table and figures")
     s.add_argument("--experiments", default=",".join(EXPERIMENTS), help="experiments in --out to include")
-    s.add_argument("--original", default="outputs/finetune_eval_original",
+    s.add_argument("--original", default=ORIGINAL_DEFAULT,
                    help="folder of the original model's videos, included if measured ('' = leave out)")
     s.add_argument("--gsscd-threshold", type=float, default=0.4, help="GSSCD from which a sample counts as copied")
 
