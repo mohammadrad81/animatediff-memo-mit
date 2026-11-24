@@ -1,4 +1,5 @@
-"""Command line interface. See README.md, or run:  python main.py {attention,guard,soften,clip,noise,sail,batch,compare} --help"""
+"""Command line interface. See README.md, or run:
+python main.py {attention,guard,soften,clip,noise,sail,frameloss,plot-frameloss,batch,compare} --help"""
 import argparse
 import csv
 import json
@@ -8,7 +9,8 @@ import numpy as np
 from PIL import Image
 
 from attention import Controller, cross_layers, install, select_layers, short
-from plots import (memorization_signals, plot_all, plot_memorization_signals, token_labels, write_guard_summary,
+from plots import (_loss_norm, frame_loss_summary, memorization_signals, plot_all, plot_frame_loss_heatmap,
+                   plot_frame_loss_lines, plot_memorization_signals, token_labels, write_guard_summary,
                    write_soften_summary)
 from sampler import load_pipeline, sample, save_gif
 
@@ -71,11 +73,19 @@ def noise_args(p):
                         "from the start for sample; 1000 = from the start)")
 
 
-def noise_controller(args):
+def update_arg(p):
+    p.add_argument("--update-frames", choices=["all", "above"], default="all",
+                   help="all: every optimizer step changes all frames; above: only the frames whose loss is still "
+                        "above the target / threshold (the loss stays the sum over all frames)")
+
+
+def noise_controller(args, update_frames="all"):
     cfg_start = args.cfg_start if args.cfg_start is not None else (900.0 if args.noise_mode == "batch" else None)
+    if update_frames == "above" and args.noise_mode != "sample":
+        raise SystemExit("updating only the frames above the target needs --noise-mode sample")
     return Controller(num_streams=2, noise_mode=args.noise_mode, rho=args.rho, gamma=args.gamma,
                       adj_iters=args.adj_iters, lr=args.lr, target=args.target, max_iters=args.max_iters,
-                      cfg_start=cfg_start)
+                      cfg_start=cfg_start, update_frames=update_frames)
 
 
 def sail_args(p):
@@ -109,11 +119,15 @@ def experiment(name, args, unet, soft_layers=()):
         layers = cross_layers(unet, args.blocks.split(","))
         return Controller(num_streams=3, guard_layers=layers, tau=args.tau, alpha=args.alpha,
                           ortho=args.ortho), args.guard_r
-    if name == "sail":  # only the initial noise changes
+    # noise / sail: every optimizer step changes all frames (or the --update-frames of the single commands);
+    # noise_above / sail_above: only the frames still above the target / threshold
+    update = "above" if name.endswith("_above") else getattr(args, "update_frames", "all")
+    if name in ("sail", "sail_above"):  # only the initial noise changes
         return Controller(num_streams=2, sail=True, sail_thres=args.sail_thres, sail_lr=args.sail_lr,
-                          sail_alpha=args.sail_alpha, sail_steps=args.sail_steps, sail_rounds=args.sail_rounds), 0.0
-    if name == "noise":  # only the initial noise changes (and CFG may start later)
-        return noise_controller(args), 0.0
+                          sail_alpha=args.sail_alpha, sail_steps=args.sail_steps, sail_rounds=args.sail_rounds,
+                          update_frames=update), 0.0
+    if name in ("noise", "noise_above"):  # only the initial noise changes (and CFG may start later)
+        return noise_controller(args, update), 0.0
     if name == "clip":  # only the prompt's text embeddings change; normal attention and CFG
         return Controller(num_streams=2, clip_mode=args.clip_mode, mask_eot=not args.keep_eot,
                           mask_ratio=args.mask_ratio), 0.0
@@ -170,7 +184,13 @@ def run_noise(args, pipe):
     install(pipe.unet, ctrl)
     frames = sample(pipe, args.prompt, ctrl, *common)
     save_gif(frames, os.path.join(args.out, "noise.gif"), args.fps)
-    before, after, steps = ctrl.noise_log[0]
+    log = ctrl.noise_log[0]
+    before, after = log["before"], log["after"]
+    steps = log.get("steps")
+    write_json(os.path.join(args.out, "noise.json"), dict(log, prompt=args.prompt))
+    if args.noise_mode == "sample":
+        plot_frame_loss_heatmap(log, os.path.join(args.out, "noise_frame_loss.png"),
+                                f"noise ({args.update_frames} frames): {args.prompt}")
     with open(os.path.join(args.out, "noise_adjustment.txt"), "w") as f:
         f.write(f"mode {args.noise_mode}, CFG from timestep {ctrl.cfg_start or 'the start'}"
                 + (f", {steps} AdamW steps" if args.noise_mode == "sample" else "") + "\n"
@@ -194,12 +214,97 @@ def run_sail(args, pipe):
     install(pipe.unet, ctrl)
     frames = sample(pipe, args.prompt, ctrl, *common)
     save_gif(frames, os.path.join(args.out, "sail.gif"), args.fps)
-    with open(os.path.join(args.out, "sail.json"), "w") as f:
-        json.dump(ctrl.sail_log[0], f, indent=2)
+    write_json(os.path.join(args.out, "sail.json"), dict(ctrl.sail_log[0], prompt=args.prompt))
+    plot_frame_loss_heatmap(ctrl.sail_log[0], os.path.join(args.out, "sail_frame_loss.png"),
+                            f"SAIL ({args.update_frames} frames): {args.prompt}")
     if args.baseline:  # baseline | SAIL next to each other
         both = [Image.fromarray(np.hstack([a, b])) for a, b in zip(baseline, frames)]
         save_gif(both, os.path.join(args.out, "baseline_vs_sail.gif"), args.fps)
     print(f"done: {args.out}")
+
+
+def write_json(path, data):
+    tmp = f"{path}.{os.getpid()}.tmp"  # renamed when complete
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+FRAMELOSS_VARIANTS = ["noise", "noise_above", "sail", "sail_above"]
+
+
+def plot_frame_loss_logs(named, out):
+    """named: list of (name, log). A heatmap per log (one colour scale per threshold, so the variants of one method
+    can be compared cell by cell), the lines of all logs in one figure, and a summary table."""
+    by_threshold = {}
+    for _, log in named:
+        by_threshold.setdefault(log["threshold"], []).append(log)
+    for name, log in named:
+        plot_frame_loss_heatmap(log, os.path.join(out, f"{name}_frame_loss.png"),
+                                f"{name} ({log['update_frames']} frames): {log.get('prompt', '')}",
+                                norm=_loss_norm(by_threshold[log["threshold"]]))
+        print(f"written: {os.path.join(out, name + '_frame_loss.png')}")
+    if len(named) <= 24:  # one panel per log
+        plot_frame_loss_lines(named, os.path.join(out, "frame_loss_lines.png"))
+    rows = [dict(variant=name, **frame_loss_summary(log)) for name, log in named]
+    with open(os.path.join(out, "frame_loss_summary.csv"), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    for r in rows:
+        print("  ".join(f"{k}={v:.3f}" if isinstance(v, float) else f"{k}={v}" for k, v in r.items()))
+    print(f"written: {os.path.join(out, 'frame_loss_summary.csv')}"
+          + (f", {os.path.join(out, 'frame_loss_lines.png')}" if len(named) <= 24 else " (no lines figure: > 24 logs)"))
+
+
+def run_frameloss(args, pipe):
+    """noise and SAIL on one prompt, each with both update rules (all frames / only frames above the threshold),
+    from the same seed: videos, per-step per-frame loss logs, and their plots."""
+    variants = args.variants.split(",")
+    if not set(variants) <= set(FRAMELOSS_VARIANTS):
+        raise SystemExit(f"--variants must be a list of {','.join(FRAMELOSS_VARIANTS)}")
+    if args.noise_mode != "sample" and any(v.startswith("noise") for v in variants):
+        raise SystemExit("the per-frame loss needs a target: use --noise-mode sample")
+    common = (args.frames, args.steps, args.height, args.width, args.seed, args.s)
+    if args.baseline:
+        plain, _ = experiment("normal", args, pipe.unet)
+        install(pipe.unet, plain)
+        save_gif(sample(pipe, args.prompt, plain, *common), os.path.join(args.out, "normal.gif"), args.fps)
+    named = []
+    for name in variants:
+        ctrl, _ = experiment(name, args, pipe.unet)
+        install(pipe.unet, ctrl)
+        save_gif(sample(pipe, args.prompt, ctrl, *common), os.path.join(args.out, f"{name}.gif"), args.fps)
+        log = dict((ctrl.sail_log if ctrl.sail else ctrl.noise_log)[0], prompt=args.prompt)
+        write_json(os.path.join(args.out, f"{name}.json"), log)
+        named.append((name, log))
+    plot_frame_loss_logs(named, args.out)
+    print(f"done: {args.out}")
+
+
+def run_plot_frameloss(args):
+    """Plot saved logs again (no model needed): the JSON files of frameloss, noise, sail, or of a batch folder."""
+    files = []
+    for p in args.paths:
+        if os.path.isdir(p):
+            files += sorted(os.path.join(p, f) for f in os.listdir(p) if f.endswith(".json") and f != "settings.json")
+        else:
+            files.append(p)
+    named = []
+    for path in files:
+        with open(path) as f:
+            log = json.load(f)
+        if "trace" not in log:
+            print(f"skipped (no per-step trace): {path}")
+            continue
+        folder = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        stem = os.path.splitext(os.path.basename(path))[0]
+        named.append((stem if stem in FRAMELOSS_VARIANTS else f"{folder}_{stem}", log))
+    if not named:
+        raise SystemExit("no log with a per-step trace found")
+    out = args.save_to or os.path.dirname(os.path.abspath(files[0]))
+    os.makedirs(out, exist_ok=True)
+    plot_frame_loss_logs(named, out)
 
 
 def run_compare(args):
@@ -272,6 +377,9 @@ EXPERIMENT_SETTINGS = {
     "noise": ["noise_mode", "rho", "gamma", "adj_iters", "lr", "target", "max_iters", "cfg_start"],
     "sail": ["sail_thres", "sail_lr", "sail_alpha", "sail_steps", "sail_rounds"],
 }
+# the same methods, but each optimizer step changes only the frames above the target / threshold
+EXPERIMENT_SETTINGS["noise_above"] = EXPERIMENT_SETTINGS["noise"]
+EXPERIMENT_SETTINGS["sail_above"] = EXPERIMENT_SETTINGS["sail"]
 EXPERIMENTS = list(EXPERIMENT_SETTINGS)
 OWN_SETTINGS = {k for keys in EXPERIMENT_SETTINGS.values() for k in keys}
 NOT_SETTINGS = ["start", "end", "batch_size", "experiments", "shard"]  # args that do not change the generated videos
@@ -347,6 +455,8 @@ def run_batch(args, pipe):
     if not set(experiments) <= set(EXPERIMENTS):
         raise SystemExit(f"--experiments must be a list of {','.join(EXPERIMENTS)}")
 
+    if "noise_above" in experiments and args.noise_mode != "sample":
+        raise SystemExit("noise_above needs --noise-mode sample (the batch-wise mode has no target)")
     check_settings(args, experiments)  # continuing a run with other settings would mix experiments
 
     layers = soften_layers(args, pipe.unet) if "soften" in experiments else ()
@@ -366,6 +476,9 @@ def run_batch(args, pipe):
             ctrl, r = experiment(name, args, pipe.unet, layers)  # a new controller per batch: nothing piles up
             install(pipe.unet, ctrl)
             videos = sample(pipe, [c for _, c in todo], ctrl, *common, r=r, r_schedule=args.r_schedule)
+            logs = ctrl.sail_log if ctrl.sail else ctrl.noise_log  # noise / SAIL: per-frame loss at every step
+            for (i, c), log in zip(todo, logs):  # <index>.json next to the GIF, written first
+                write_json(os.path.join(args.out, name, f"{i}.json"), dict(log, index=i, prompt=c))
             for (i, _), frames in zip(todo, videos):  # written under another name first: a GIF that exists is complete
                 save_gif(frames, gif(name, i) + ".tmp.gif", args.fps)
                 os.replace(gif(name, i) + ".tmp.gif", gif(name, i))
@@ -397,7 +510,9 @@ def main():
     b = sub.add_parser("batch", help="run normal / guard / soften / clip / noise / sail on every prompt of a CSV sheet")
     video_args(b, "outputs/batch", prompt=False)
     b.add_argument("--csv", required=True, help="CSV file with the columns 'index' and 'caption'")
-    b.add_argument("--experiments", default="normal,guard,soften,clip,noise,sail", help="any of normal,guard,soften,clip,noise,sail")
+    b.add_argument("--experiments", default="normal,guard,soften,clip,noise,sail",
+                   help="any of normal,guard,soften,clip,noise,sail,noise_above,sail_above (_above: each optimizer "
+                        "step changes only the frames above the target / threshold)")
     b.add_argument("--start", type=int, default=0, help="first CSV row to run (0 = first data row)")
     b.add_argument("--end", type=int, default=None, help="stop before this CSV row (default: the end of the sheet)")
     b.add_argument("--batch-size", type=int, default=1, help="prompts generated together in one UNet pass")
@@ -418,12 +533,26 @@ def main():
     n = sub.add_parser("noise", help="generate a video from adjusted initial noise (batch-wise / per-sample)")
     video_args(n, "outputs/noise")
     noise_args(n)
+    update_arg(n)
     n.add_argument("--baseline", action="store_true", help="also generate the plain AnimateDiff video (same seed)")
 
     sl = sub.add_parser("sail", help="generate a video from sharpness-aware initial noise (SAIL)")
     video_args(sl, "outputs/sail")
     sail_args(sl)
+    update_arg(sl)
     sl.add_argument("--baseline", action="store_true", help="also generate the plain AnimateDiff video (same seed)")
+
+    fl = sub.add_parser("frameloss", help="noise and SAIL on one prompt, updating all frames / only the frames above "
+                                          "the threshold: videos, and every frame's loss at every optimizer step")
+    video_args(fl, "outputs/frameloss")
+    noise_args(fl)
+    sail_args(fl)
+    fl.add_argument("--variants", default=",".join(FRAMELOSS_VARIANTS), help=f"any of {','.join(FRAMELOSS_VARIANTS)}")
+    fl.add_argument("--baseline", action="store_true", help="also generate the plain AnimateDiff video (same seed)")
+
+    pf = sub.add_parser("plot-frameloss", help="plot saved per-frame loss logs again (JSON files or folders)")
+    pf.add_argument("paths", nargs="+", help="JSON logs, or folders of them (e.g. outputs/batch/noise_above)")
+    pf.add_argument("--save-to", default=None, help="folder of the figures (default: the folder of the first log)")
 
     c = sub.add_parser("compare", help="overlay the memorization signals of several attention runs")
     c.add_argument("dirs", nargs="+", help="output folders of the attention command")
@@ -432,6 +561,8 @@ def main():
     args = parser.parse_args()
     if args.command == "compare":  # only reads JSON files: no model is loaded
         return run_compare(args)
+    if args.command == "plot-frameloss":
+        return run_plot_frameloss(args)
     os.makedirs(args.out, exist_ok=True)
     pipe = load_pipeline(model=args.model)
     if args.command == "attention":
@@ -444,6 +575,8 @@ def main():
         run_noise(args, pipe)
     elif args.command == "clip":
         run_clip(args, pipe)
+    elif args.command == "frameloss":
+        run_frameloss(args, pipe)
     elif args.command == "soften":
         run_soften(args, pipe)
     else:

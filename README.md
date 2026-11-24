@@ -27,7 +27,8 @@ Model: `CompVis/stable-diffusion-v1-4` + motion adapter `guoyww/animatediff-moti
 Commands:
 - `attention` generates a video and plots spatial, cross- and temporal attention for every layer, head, frame and diffusion step, with spikes marked. It also saves the memorization signals.
 - `guard`, `soften`, `clip`, `noise` and `sail` each generate a video with one method, and with `--baseline` also the normal video (same seed) side by side.
-- `batch` runs any of the experiments on every prompt of a CSV sheet and saves the GIFs.
+- `frameloss` runs `noise` and `sail` on one prompt, each updating all frames or only the frames above the threshold, and plots every frame's loss at every optimizer step (section 6a); `plot-frameloss` plots saved logs again.
+- `batch` runs any of the experiments on every prompt of a CSV sheet and saves the GIFs (`noise_above` and `sail_above` are the "only frames above the threshold" variants).
 - `compare` overlays the memorization signals of several `attention` runs.
 
 Each method's section below explains it, how it was adapted from images to video, and where the code
@@ -520,6 +521,72 @@ at the current `x`, as the paper's algorithm describes. The gradient includes th
   `α‖x‖` rewards a smaller norm.
 - **What the video looked like:** the memorized Daredevil figure was gone, but the video became a flat, low-detail
   red and blue scene. A smaller noise norm tends to give smoother images, so check quality against `noise`.
+
+### 6a. Per-frame loss: update all frames, or only the frames above the threshold (`frameloss`)
+
+Per-sample `noise` and `sail` optimize the initial noise until **the largest per-frame loss** is at or below the
+threshold (`noise`: `‖ε̃_f‖ ≤ target`; `sail`: `loss_f ≤ sail-thres`). There are two update rules:
+
+| rule | what one optimizer step changes |
+|---|---|
+| `all` (default, the methods as before) | every frame's latent |
+| `above` | only the latents of the frames whose loss is still above the threshold at that step |
+
+With `above`, the loss is still the sum over **all** frames. A frozen frame gets gradient 0, and its values are
+put back after the step, since Adam's momentum and AdamW's weight decay would otherwise still move it. A frame can
+cross the threshold again: the frames interact through the motion modules, so changing one frame changes the
+others' loss. If that happens it is updated again. The stopping rule (max over frames ≤ threshold) is the same.
+
+```bash
+# both methods, both rules, one prompt, from the same seed (fine-tuned model at 256x256)
+python main.py --model outputs/finetune/final frameloss --prompt "..." --height 256 --width 256 --baseline --out outputs/frameloss
+# a single method with the other rule
+python main.py noise --prompt "..." --update-frames above
+python main.py sail  --prompt "..." --update-frames above
+# on a CSV sheet: noise_above / sail_above are batch experiments of their own (folders noise_above/, sail_above/)
+python main.py --model outputs/finetune/final batch --csv ... --experiments noise,noise_above,sail,sail_above ...
+# plot saved logs again (no model): frameloss folders, single files, or batch experiment folders
+python main.py plot-frameloss outputs/batch/noise_above outputs/batch/sail_above --save-to outputs/batch/frameloss_plots
+```
+
+Every run writes a JSON log per video: `<variant>.json` (`frameloss`), `noise.json` / `sail.json` (single commands)
+or `<out>/<experiment>/<index>.json` next to the GIF (`batch`, for `noise`, `noise_above`, `sail` and `sail_above`).
+Its `trace` has every frame's loss at **every** optimizer step: one segment for `noise`, one per round for SAIL
+(with the seed, and SAIL's sharpness term separately), plus which frames each step changed.
+
+Figures:
+- `<variant>_frame_loss.png`: heatmap, rows = frames, columns = optimizer steps, **the loss written in every
+  cell**. The colour scale is centred on the threshold (gray), red above, blue below. Values above the threshold
+  are **bold**. Hatched cells are frames the step did not change. Under each step number: how many frames it
+  changed; `end` = where it stopped (evaluated, no step). Long runs wrap onto several rows; SAIL rounds are
+  separate rows. Variants with the same threshold share one colour scale, so their cells can be compared directly.
+- `frame_loss_lines.png`: per variant, every frame's loss over the steps (gray), the max over frames (blue) and the
+  threshold (dashed). Only drawn for at most 24 logs.
+- `frame_loss_summary.csv`: per log, steps, frame updates, start / kept max and median, spread over frames, and the
+  number of frames above the threshold.
+
+Notes:
+- `noise_above` needs `--noise-mode sample` (the batch-wise mode has no target).
+- The memorization and quality scripts accept `noise_above` and `sail_above` in `--experiments`; their default lists
+  stay the six main experiments.
+- Batch noise / SAIL folders made before this change have no logs, so they have to be regenerated to be plotted.
+  GPU runs are not bit-reproducible (float16 backward), so two runs differ by about 1e-3 per step.
+
+**First test** (fine-tuned model, 256×256, the 48-copy prompt "The indian peacock's train …", seed 0;
+`outputs/frameloss`):
+
+| variant | optimizer steps | frame updates | max loss: start → kept | frames above at the end |
+|---|---|---|---|---|
+| noise | 43 | 688 | 1.858 → 0.196 | 0 |
+| noise_above | 50 | 568 | 1.858 → 0.197 | 0 |
+| sail | 8 | 128 | 5.012 → 3.394 | 0 |
+| sail_above | 9 | 92 | 5.012 → 3.394 | 0 |
+
+All 16 frames start above the threshold and fall almost together, so `above` only starts freezing frames near the
+end (noise: from step 32; SAIL: from step 4). It then needs a few more steps, because the last frames move alone,
+but about 15–30% fewer frame updates. The frozen frames keep falling a little, since the updated frames change
+them through the motion modules. With `all`, the frames end up spread further below the threshold (noise median
+0.136 vs 0.170).
 
 ### 7. Run the experiments on a CSV sheet of prompts (`batch`)
 
@@ -1162,6 +1229,37 @@ python memorization_eval.py mitigation
 python quality_eval.py metrics --experiments soften
 python quality_eval.py summary
 ```
+
+**The "only frames above the threshold" variants** (`noise_above`, `sail_above`, section 6a) are two more methods in
+the same folder, compared with all the others. To compare them fairly with `noise/` and `sail/`, they must use **the same
+thresholds** as those videos (`--target 0.2`, SAIL 3.4 = `α·√4096 + 0.2`) and the same batch size and shards (the
+batch composition changes the float16 results slightly). Give the thresholds explicitly, since the defaults may have
+changed since `noise/` and `sail/` were made. `batch` does not compare a variant's settings with its base method's:
+check that they match yourself.
+
+```bash
+# 1. the videos (each also gets <index>.json: every frame's loss at every optimizer step)
+for k in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$k nohup python main.py --model outputs/finetune/final batch \
+      --csv outputs/finetune_eval/prompts.csv --out outputs/finetune_eval --experiments noise_above,sail_above \
+      --target 0.2 --sail-thres 3.4 \
+      --height 256 --width 256 --batch-size 5 --shard $k/4 > outputs/finetune_above_$k.log 2>&1 &
+done
+
+# 2. once all 400 of each exist: memorization and quality, then the summaries with all eight
+python memorization_eval.py metrics --experiments noise_above,sail_above
+for m in noise_above sail_above; do python memorization_eval.py plot --experiment $m; done
+python memorization_eval.py mitigation --experiments normal,guard,soften,clip,noise,noise_above,sail,sail_above
+python quality_eval.py metrics --experiments noise_above,sail_above
+python quality_eval.py summary --experiments normal,guard,soften,clip,noise,noise_above,sail,sail_above
+
+# 3. optional: per-frame loss plots of the new videos (heatmaps of all 400 per folder, and a summary table)
+python main.py plot-frameloss outputs/finetune_eval/noise_above --save-to outputs/finetune_eval/frameloss_noise_above
+python main.py plot-frameloss outputs/finetune_eval/sail_above --save-to outputs/finetune_eval/frameloss_sail_above
+```
+
+Without `--experiments`, `mitigation` and `summary` show the six main experiments only. The old `noise/` and `sail/`
+videos have no per-frame logs, so only the `_above` variants can be plotted per frame unless those are made again.
 
 **Things to keep in mind**
 - The methods run with their default settings (sections 2–6). Those were chosen on the original model at 512×512; the

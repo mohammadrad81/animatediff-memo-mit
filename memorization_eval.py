@@ -126,7 +126,10 @@ def summarize(df, by, ofs):
 # The experiments of `main.py batch`: the plain videos (normal) and the five mitigation methods. Each one's videos are
 # in <out>/<experiment>/, all made from the same captions and the same starting noise (seed).
 EXPERIMENTS = {"normal": "No mitigation", "guard": "GUARD", "soften": "Softened attention", "clip": "CLIP embeddings",
-               "noise": "Initial-noise adjustment", "sail": "SAIL"}
+               "noise": "Initial-noise adjustment", "sail": "SAIL",
+               # the same methods, but each optimizer step changes only the frames still above the threshold
+               "noise_above": "Initial-noise adj. (above)", "sail_above": "SAIL (above)"}
+DEFAULT_EXPERIMENTS = "normal,guard,soften,clip,noise,sail"  # the _above variants only when asked for
 
 
 def result_file(folder, name, experiment="normal"):
@@ -718,7 +721,7 @@ def main():
     c.add_argument("--groups", type=int, default=5, help="groups of copies")
 
     g = sub.add_parser("mitigation", help="figures of the mitigation methods against no mitigation, same prompts")
-    g.add_argument("--experiments", default=",".join(EXPERIMENTS),
+    g.add_argument("--experiments", default=DEFAULT_EXPERIMENTS,
                    help="experiments to compare (metrics in --out), normal included")
     g.add_argument("--original", default=ORIGINAL_DEFAULT,
                    help="folder with metrics.csv of the original model, drawn as the reference if it exists ('' = none)")

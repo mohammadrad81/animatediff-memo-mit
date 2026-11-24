@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from finetune import read_clip
-from memorization_eval import (BACKGROUND_COLOR, EXPERIMENTS, GRID, INK, MEMORIZED_COLOR, MUTED, NO_MITIGATION_COLOR,
+from memorization_eval import (BACKGROUND_COLOR, DEFAULT_EXPERIMENTS, EXPERIMENTS, GRID, INK, MEMORIZED_COLOR, MUTED, NO_MITIGATION_COLOR,
                                ORIGINAL_COLOR, ORIGINAL_DEFAULT, experiment_list, pyplot, result_file, save_figures)
 from webvid import gif_frames, square, video_path
 
@@ -300,7 +300,7 @@ def plot_quality_bars(summary, plt):
     x = np.arange(len(names))
     fig, axes = plt.subplots(2, 1, figsize=(max(9, 1.55 * len(names)), 8.6), sharex=True)
     for ax, (column, title) in zip(axes, [("fvd", "FVD against real WebVid clips (lower = more realistic)"),
-                                          ("viclip_mean", "ViCLIP similarity to the caption (higher = matches the caption better)")]):
+                                          ("viclip_mean", "Mean ViCLIP similarity to the caption (higher = matches the caption better)")]):
         for offset, group, color in [(-0.19, "Memorized samples", MEMORIZED_COLOR), (0.19, "Background samples", BACKGROUND_COLOR)]:
             values = [summary.loc[(summary["name"] == n) & (summary["group"] == group), column].iloc[0] for n in names]
             bars = ax.bar(x + offset, values, width=0.36, color=color, label=group)
@@ -313,13 +313,14 @@ def plot_quality_bars(summary, plt):
         ax.margins(y=0.12)
         ax.grid(False, axis="x")
     axes[0].set_ylabel("FVD")
-    axes[1].set_ylabel("Mean cosine similarity")
+    axes[1].set_ylabel("Mean ViCLIP")
     axes[-1].set_xticks(x, [label_of(n) for n in names], fontsize=11)
+    axes[0].tick_params(labelbottom=True)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, frameon=False, ncol=2, loc="lower center", bbox_to_anchor=(0.5, 0.035), fontsize=11)
     fig.tight_layout(rect=(0, 0.09, 1, 1))
-    fig.text(0.5, 0.005, "FVD of 200 videos per group is noisy and higher than with thousands; compare the rows with each "
-             "other, and with the real training clips (the best 200 videos can get).", ha="center", fontsize=10.5, color=MUTED)
+    # fig.text(0.5, 0.005, "FVD of 200 videos per group is noisy and higher than with thousands; compare the rows with each "
+            #  "other, and with the real training clips (the best 200 videos can get).", ha="center", fontsize=10.5, color=MUTED)
     return fig
 
 
@@ -339,6 +340,8 @@ def plot_quality_vs_memorization(summary, plt):
             if row["name"] in ("original", "normal"):
                 above = column == "viclip_mean"
                 offset, ha, va = (0, 9 if above else -9), "center", "bottom" if above else "top"
+            elif row["name"].endswith("_above"):  # usually next to its own method, which is labelled on the right
+                offset, ha, va = (7, -7), "left", "top"
             else:
                 offset, ha, va = (7, 5), "left", "baseline"
             ax.annotate(label_of(row["name"]).replace("\n", " "), (row["memorized_copied_%"], row[column]),
@@ -394,7 +397,7 @@ def main():
     m.add_argument("--batch", type=int, default=8, help="videos per pass")
 
     s = sub.add_parser("summary", help="FVD, ViCLIP and the memorization of every method: table and figures")
-    s.add_argument("--experiments", default=",".join(EXPERIMENTS), help="experiments in --out to include")
+    s.add_argument("--experiments", default=DEFAULT_EXPERIMENTS, help="experiments in --out to include")
     s.add_argument("--original", default=ORIGINAL_DEFAULT,
                    help="folder of the original model's videos, included if measured ('' = leave out)")
     s.add_argument("--gsscd-threshold", type=float, default=0.4, help="GSSCD from which a sample counts as copied")

@@ -18,6 +18,7 @@ import os
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.ticker
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -327,3 +328,142 @@ def plot_memorization_signals(runs, path):
         ax.grid(alpha=0.3)
         ax.legend(fontsize=7)
     save(fig, path)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Per-frame loss of the initial-noise optimization (noise per-sample and SAIL), at every optimizer step.
+# A log (see sampler.adjust_noise / sampler.sail) has "threshold", "loss_name", "update_frames" and "trace": a list
+# of segments (one for noise, one per round for SAIL), each with "seed", "loss" [steps][frames] (steps evaluated, the
+# last one is where it stopped) and "updated" [steps taken][frames] (frames the optimizer step changed).
+
+DIVERGING = ["#2a78d6", "#f0efec", "#e34948"]  # below threshold (blue) - threshold (neutral gray) - above (red)
+INK, MUTED_INK = "#1f1f1e", "#6b6b66"
+STEPS_PER_ROW = 25  # longer runs are wrapped onto more rows of the figure
+
+
+def frame_loss_cmap():
+    from matplotlib.colors import LinearSegmentedColormap
+    return LinearSegmentedColormap.from_list("below_above", DIVERGING)
+
+
+def _loss_norm(logs):
+    """One colour scale for several logs with the same threshold: centred on it, so gray = at the threshold."""
+    thres = logs[0]["threshold"]
+    values = [v for log in logs for seg in log["trace"] for row in seg["loss"] for v in row]
+    span = max(max(values) - thres, thres - min(values), 1e-6)
+    return TwoSlopeNorm(vmin=min(min(values), thres - 1e-3 * span), vcenter=thres,
+                        vmax=max(max(values), thres + 1e-3 * span))
+
+
+def plot_frame_loss_heatmap(log, path, title, norm=None):
+    """Rows = frames, columns = optimizer steps; every cell shows the frame's loss at that step (bold = above the
+    threshold, hatched = that frame was not changed by the step). Under each step: how many frames it changed."""
+    thres, fmt = log["threshold"], "{:.3f}"
+    norm = norm or _loss_norm([log])
+    cmap = frame_loss_cmap()
+    panels = []  # (segment index, first step, last step + 1); long segments are split into rows of equal length
+    for k, seg in enumerate(log["trace"]):
+        n = len(seg["loss"])
+        per_row = -(-n // -(-n // STEPS_PER_ROW))
+        for a in range(0, n, per_row):
+            panels.append((k, a, min(a + per_row, n)))
+    frames = len(log["trace"][0]["loss"][0])
+    widest = max(b - a for _, a, b in panels)
+    cell_w, cell_h = 0.46, 0.22
+    fig_w = 1.1 + widest * cell_w + 0.9
+    heights = [frames * cell_h + 0.75 for _ in panels]
+    fig, axes = plt.subplots(len(panels), 1, figsize=(fig_w, sum(heights) + 0.6), squeeze=False,
+                             gridspec_kw={"height_ratios": heights}, layout="constrained")
+    for ax, (k, a, b) in zip(axes[:, 0], panels):
+        seg = log["trace"][k]
+        loss = np.array(seg["loss"][a:b]).T  # [frames, steps]
+        im = ax.imshow(loss, cmap=cmap, norm=norm, aspect="auto", interpolation="nearest",
+                       extent=(a - 0.5, b - 0.5, frames - 0.5, -0.5))
+        for j in range(a, b):
+            upd = seg["updated"][j] if j < len(seg["updated"]) else None  # None: last step evaluated, no update
+            for f in range(frames):
+                v = seg["loss"][j][f]
+                r, g, bl, _ = cmap(norm(v))
+                dark = 0.2126 * r + 0.7152 * g + 0.0722 * bl < 0.45
+                ax.text(j, f, fmt.format(v), ha="center", va="center", fontsize=6,
+                        color="white" if dark else INK, fontweight="bold" if v > thres else "normal")
+                if upd is not None and not upd[f]:
+                    ax.add_patch(plt.Rectangle((j - 0.5, f - 0.5), 1, 1, fill=False, hatch="//",
+                                               edgecolor="#b4b3ad", linewidth=0))
+        ax.set_xlim(a - 0.5, a + widest - 0.5)  # same cell width in every row
+        ax.set_xticks(range(a, b))
+        ax.set_xticklabels([f"{j}\n{sum(seg['updated'][j])}" if j < len(seg["updated"]) else f"{j}\nend"
+                            for j in range(a, b)], fontsize=6.5, color=MUTED_INK)
+        ax.set_yticks(range(frames))
+        ax.set_yticklabels([f"frame {f}" for f in range(frames)], fontsize=6.5, color=MUTED_INK)
+        ax.tick_params(length=0)
+        for side in ax.spines.values():
+            side.set_visible(False)
+        label = f"round {k} (seed {seg['seed']})" if seg.get("seed") is not None else ""
+        part = f"steps {a}-{b - 1}" if len(seg["loss"]) > STEPS_PER_ROW else ""
+        ax.set_title("  ·  ".join(x for x in [label, part] if x), loc="left", fontsize=8, color=INK)
+        ax.set_xlabel("optimizer step  /  frames changed by the step", fontsize=7, color=MUTED_INK)
+    cbar = fig.colorbar(im, ax=axes[:, 0].tolist(), fraction=0.9 / fig_w, pad=0.01, aspect=40)
+    cbar.ax.axhline(thres, color=INK, linewidth=1)
+    cbar.set_label(f"{log['loss_name']}  (threshold {thres:.3g}: gray)", fontsize=7, color=MUTED_INK)
+    cbar.ax.tick_params(labelsize=6.5, colors=MUTED_INK)
+    cbar.outline.set_visible(False)
+    import textwrap
+    fig.suptitle(textwrap.fill(title, int(fig_w * 14)) + f"\nbold = above the threshold {thres:.3g}, "
+                 "hatched = frame not changed by that step", x=0.01, ha="left", fontsize=9, color=INK)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_frame_loss_lines(runs, path):
+    """One panel per run (name, log): every frame's loss over the optimizer steps (thin gray), the maximum over frames
+    (blue) and the threshold (dashed). SAIL rounds follow each other, separated by a vertical line."""
+    cols = min(len(runs), 4)
+    rows = -(-len(runs) // cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(4.2 * cols, 3.2 * rows + 0.4), squeeze=False)
+    for ax in axes.flat[len(runs):]:
+        ax.set_visible(False)
+    for ax, (name, log) in zip(axes.flat, runs):
+        x0 = 0
+        for k, seg in enumerate(log["trace"]):
+            loss = np.array(seg["loss"])  # [steps, frames]
+            xs = np.arange(x0, x0 + len(loss))
+            for f in range(loss.shape[1]):
+                ax.plot(xs, loss[:, f], color="#a3a29c", linewidth=0.8, label="each frame" if k == f == 0 else None)
+            ax.plot(xs, loss.max(1), color="#2a78d6", linewidth=2,
+                    label="max over frames" if k == 0 else None)
+            if k:
+                ax.axvline(x0 - 0.5, color=MUTED_INK, linewidth=0.8)
+                ax.text(x0 - 0.3, 0.98, f"seed {seg['seed']}", fontsize=7, color=MUTED_INK, va="top",
+                        transform=ax.get_xaxis_transform())
+            x0 += len(loss)
+        ax.axhline(log["threshold"], color=INK, linestyle="--", linewidth=1, label="threshold")
+        ax.xaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+        ax.set_title(f"{name}: {log.get('frame_updates', '?')} frame updates, threshold {log['threshold']:.3g}",
+                     loc="left", fontsize=9, color=INK)
+        ax.set_xlabel("optimizer step (rounds one after the other)" if len(log["trace"]) > 1 else "optimizer step",
+                      fontsize=8, color=MUTED_INK)
+        ax.set_ylabel(log["loss_name"], fontsize=8, color=MUTED_INK)
+        ax.grid(color="#e6e5e1", linewidth=0.6)
+        for side in ["top", "right"]:
+            ax.spines[side].set_visible(False)
+        ax.tick_params(labelsize=7, colors=MUTED_INK)
+    fig.tight_layout(rect=(0, 0.4 / (3.2 * rows + 0.4), 1, 1))
+    fig.legend(*axes[0, 0].get_legend_handles_labels(), loc="lower center", ncol=3, fontsize=8, frameon=False)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def frame_loss_summary(log):
+    """Numbers of one log for the summary table."""
+    first, last = np.array(log["trace"][0]["loss"][0]), np.array(log["trace"][-1]["loss"][-1])
+    # the noise that is used: SAIL keeps the best step of all rounds, noise the last step
+    kept = np.array(log["trace"][log["round"]]["loss"][log["steps"]] if log["method"] == "sail"
+                    else log["trace"][0]["loss"][-1])
+    thres = log["threshold"]
+    return {"reached": log["reached"], "rounds": len(log["trace"]),
+            "optimizer_steps": sum(len(s["updated"]) for s in log["trace"]), "frame_updates": log["frame_updates"],
+            "start_max": first.max(), "start_median": float(np.median(first)),
+            "frames_above_start": int((first > thres).sum()),
+            "kept_max": kept.max(), "kept_median": float(np.median(kept)), "kept_std_over_frames": kept.std(),
+            "frames_above_kept": int((kept > thres).sum()), "last_round_end_max": last.max()}

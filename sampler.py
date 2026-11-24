@@ -93,6 +93,22 @@ def per_frame(n):
     return n[:, None, :, None, None]
 
 
+def masked_step(optim, lat, grad, update):
+    """One optimizer step on lat [1, 4, frames, h, w] that changes only the frames where update [1, frames] is True.
+    The gradient of the other frames is set to 0, and their values are put back after the step, since Adam's
+    momentum and AdamW's weight decay would otherwise still move them. update None: every frame changes."""
+    optim.zero_grad()
+    if update is None:
+        lat.grad = grad
+        optim.step()
+        return
+    keep = lat.detach().clone()
+    lat.grad = grad * per_frame(update.to(grad.dtype))
+    optim.step()
+    with torch.no_grad():
+        lat.copy_(torch.where(per_frame(update), lat, keep))
+
+
 def guidance_vjp(pipe, x, t, e_null, e_prompt, v):
     """J^T v, with J the Jacobian of eps~(x) = eps_cond - eps_null w.r.t. the latent x (one video, float32).
     The two streams are backpropagated one after the other and the UNet blocks are recomputed instead of
@@ -131,11 +147,17 @@ def adjust_noise(pipe, x, t, e_null, e_prompt, ctrl):
         delta = rho * eps~(x) / ||eps~(x)||                (per frame)
         x     = x - gamma * (eps~(x + delta) - eps~(x))    (sharpness-aware step towards a smaller ||eps~||)
     "sample" (Appendix A): AdamW on x minimising sum over frames of ||eps~(x)||, for each video on its own,
-        until every frame has ||eps~|| <= target (or max_iters steps)."""
+        until every frame has ||eps~|| <= target (or max_iters steps).
+        ctrl.update_frames "all": every step changes all frames; "above": a step changes only the frames whose
+        ||eps~|| is still above target (the loss is the same sum over all frames, see masked_step).
+    ctrl.noise_log gets one dict per video; in "sample" mode its "trace" has every frame's ||eps~|| at every step."""
     x = x.float()
     before = frame_norm(guidance_eps(pipe, x, t, e_null, e_prompt))
-    steps = [0] * x.shape[0]
+    steps, traces = [0] * x.shape[0], [None] * x.shape[0]
+    above = ctrl.update_frames == "above"
     if ctrl.noise_mode == "batch":
+        if above:
+            raise ValueError("update_frames='above' needs the per-sample mode: the batch-wise mode has no target")
         for _ in range(ctrl.adj_iters):
             d = guidance_eps(pipe, x, t, e_null, e_prompt)
             delta = ctrl.rho * d / frame_norm(d)[:, None, :, None, None]
@@ -146,24 +168,31 @@ def adjust_noise(pipe, x, t, e_null, e_prompt, ctrl):
             lat = x[v:v + 1].clone().requires_grad_(True)
             optim = torch.optim.AdamW([lat], lr=ctrl.lr)  # default weight decay 0.01 keeps x near N(0, I)
             en, ep = e_null[v:v + 1], e_prompt[v:v + 1]
-            pbar = tqdm(range(ctrl.max_iters), desc="adjusting noise")
+            trace = traces[v] = {"seed": None, "loss": [], "updated": []}
+            pbar = tqdm(range(ctrl.max_iters + 1), desc=f"adjusting noise ({ctrl.update_frames} frames)")
             for steps[v] in pbar:
                 d = guidance_eps(pipe, lat.detach(), t, en, ep)
                 n = frame_norm(d)
-                pbar.set_postfix(max_norm=f"{n.max():.3f}", target=ctrl.target)
-                if n.max() <= ctrl.target:
+                trace["loss"].append(n[0].tolist())
+                update = n > ctrl.target if above else None
+                pbar.set_postfix(max_norm=f"{n.max():.3f}", target=ctrl.target,
+                                 updating=int((n > ctrl.target).sum()) if above else n.shape[1])
+                if n.max() <= ctrl.target or steps[v] == ctrl.max_iters:
                     break
-                optim.zero_grad()  # gradient of sum_f ||eps~_f|| is J^T (eps~ / ||eps~||), per frame
-                lat.grad = guidance_vjp(pipe, lat, t, en, ep, d / per_frame(n))
-                optim.step()
-            else:
-                steps[v] = ctrl.max_iters
+                trace["updated"].append(update[0].tolist() if above else [True] * n.shape[1])
+                # gradient of sum_f ||eps~_f|| is J^T (eps~ / ||eps~||), per frame
+                masked_step(optim, lat, guidance_vjp(pipe, lat, t, en, ep, d / per_frame(n)), update)
             videos.append(lat.detach())
         x = torch.cat(videos)
     after = frame_norm(guidance_eps(pipe, x, t, e_null, e_prompt))
     for v in range(x.shape[0]):
-        ctrl.noise_log.append((before[v].tolist(), after[v].tolist(), steps[v]))
-        print(f"initial noise adjusted ({ctrl.noise_mode}): max over frames of ||eps_cond - eps_null|| "
+        log = {"method": "noise", "mode": ctrl.noise_mode, "before": before[v].tolist(), "after": after[v].tolist()}
+        if ctrl.noise_mode == "sample":
+            log.update(update_frames=ctrl.update_frames, steps=steps[v], threshold=ctrl.target,
+                       reached=after[v].max().item() <= ctrl.target, loss_name="||eps_cond - eps_null||",
+                       frame_updates=sum(map(sum, traces[v]["updated"])), trace=[traces[v]])
+        ctrl.noise_log.append(log)
+        print(f"initial noise adjusted ({ctrl.noise_mode}, {ctrl.update_frames} frames): max over frames of ||eps_cond - eps_null|| "
               f"{before[v].max():.3f} -> {after[v].max():.3f}" + (f" in {steps[v]} steps" if ctrl.noise_mode == "sample" else ""))
     return x.to(pipe.unet.dtype)
 
@@ -177,21 +206,26 @@ def sail(pipe, x, t, e_null, e_prompt, ctrl, seed):
     If that fails, a new noise (seed + 1, + 2, ...) is tried, at most sail_rounds times (the official code also
     restarts with new seeds); the noise with the lowest loss is kept. Round 0 starts from the normal noise.
     sail_thres None: alpha * sqrt(latent size of a frame) + 0.2, i.e. the Gaussian term of N(0, I) noise plus a
-    sharpness term of 0.2 (6.6 at 512x512); a fixed number would depend on the resolution."""
+    sharpness term of 0.2 (6.6 at 512x512); a fixed number would depend on the resolution.
+    ctrl.update_frames "all": every Adam step changes all frames; "above": a step changes only the frames whose loss
+    is still above the threshold (the loss is the same sum over all frames, see masked_step).
+    ctrl.sail_log gets one dict per video; its "trace" has every frame's loss at every step of every round."""
     thres = ctrl.sail_thres
     if thres is None:
-        thres = ctrl.sail_alpha * (x[:, :, 0].numel() / x.shape[0]) ** 0.5 + 0.2
+        thres = ctrl.sail_alpha * (x[:, :, 0].numel() / x.shape[0]) ** 0.5 + 0.65
     videos = []
     for v in range(x.shape[0]):
         en, ep = e_null[v:v + 1], e_prompt[v:v + 1]
         eps = lambda z: guidance_eps(pipe, z, t, en, ep)
         best = None  # (max loss over frames, latent, round, steps, per-frame loss, sharpness, |x|)
         first = None  # sharpness term per frame of the normal noise, before any step
+        trace = []    # per round: seed, and per step the loss and sharpness of every frame, frames updated
         for r in range(ctrl.sail_rounds):
             start = x[v:v + 1] if r == 0 else torch.randn(x[v:v + 1].shape, device=x.device,
                                                           generator=torch.Generator(x.device).manual_seed(seed + r))
             lat = start.float().clone().requires_grad_(True)
             optim = torch.optim.Adam([lat], lr=ctrl.sail_lr)
+            trace.append({"seed": seed + r, "loss": [], "sharpness": [], "updated": []})
             for step in range(ctrl.sail_steps + 1):
                 z = lat.detach()
                 d = eps(z)
@@ -201,6 +235,8 @@ def sail(pipe, x, t, e_null, e_prompt, ctrl, seed):
                 ny = frame_norm(dy)
                 loss = ny + ctrl.sail_alpha * frame_norm(z)    # [1, frames]
                 first = ny[0].tolist() if first is None else first
+                trace[-1]["loss"].append(loss[0].tolist())
+                trace[-1]["sharpness"].append(ny[0].tolist())
                 if best is None or loss.max() < best[0]:
                     best = (loss.max().item(), z.clone(), r, step, loss[0].tolist(), ny[0].tolist(), frame_norm(z)[0].tolist())
                 if loss.max() <= thres or step == ctrl.sail_steps:
@@ -210,16 +246,19 @@ def sail(pipe, x, t, e_null, e_prompt, ctrl, seed):
                 u = guidance_vjp(pipe, y, t, en, ep, dy / per_frame(ny))
                 dh = d / per_frame(n)
                 w = (u - dh * per_frame((dh * u).transpose(1, 2).flatten(2).sum(-1))) / per_frame(n)
-                optim.zero_grad()
-                lat.grad = u + guidance_vjp(pipe, z, t, en, ep, w) + ctrl.sail_alpha * z / per_frame(frame_norm(z))
-                optim.step()
-            print(f"SAIL round {r} (seed {seed + r}): max loss over frames {loss.max():.3f} after {step} steps "
+                update = loss > thres if ctrl.update_frames == "above" else None
+                trace[-1]["updated"].append(update[0].tolist() if update is not None else [True] * loss.shape[1])
+                masked_step(optim, lat, u + guidance_vjp(pipe, z, t, en, ep, w)
+                            + ctrl.sail_alpha * z / per_frame(frame_norm(z)), update)
+            print(f"SAIL round {r} (seed {seed + r}, {ctrl.update_frames} frames): max loss over frames {loss.max():.3f} after {step} steps "
                   f"(threshold {thres:.2f})")
             if loss.max() <= thres:
                 break
-        ctrl.sail_log.append({"loss": best[0], "threshold": thres, "round": best[2], "seed": seed + best[2],
-                              "steps": best[3], "reached": best[0] <= thres, "frame_loss": best[4],
-                              "frame_sharpness_before": first, "frame_sharpness": best[5], "frame_x_norm": best[6]})
+        ctrl.sail_log.append({"method": "sail", "update_frames": ctrl.update_frames, "loss": best[0], "threshold": thres,
+                              "round": best[2], "seed": seed + best[2], "steps": best[3], "reached": best[0] <= thres,
+                              "frame_loss": best[4], "frame_sharpness_before": first, "frame_sharpness": best[5],
+                              "frame_x_norm": best[6], "loss_name": "||eps~(x + d)|| + alpha ||x||",
+                              "frame_updates": sum(sum(map(sum, rd["updated"])) for rd in trace), "trace": trace})
         videos.append(best[1])
     return torch.cat(videos).to(pipe.unet.dtype)
 
