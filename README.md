@@ -1321,6 +1321,71 @@ center square, 256×256):
 - **ViCLIP is a caption score, not a memorization score**: a copied training video matches its caption well. Read it with
   the memorization: a good method keeps ViCLIP near no mitigation while fewer videos are copied.
 
+**9. All the methods on memorization and quality together** (`method_comparison.py`). Steps 7 and 8 show one score at a
+time; this step puts every method on all of them at once. It reads only the files of steps 5–8 (no GPU, no videos), so
+run it after both `memorization_eval.py metrics` and `quality_eval.py metrics` have measured every method, and the
+original model (its `metrics.csv`, `quality.csv` and `i3d_features.npy` in `outputs/finetune_eval_original512`):
+
+```bash
+python method_comparison.py                       # all the methods; about 1 minute
+python method_comparison.py --methods guard,noise,sail --save-to outputs/finetune_tradeoff_3   # only these methods, in another folder
+python method_comparison.py --overlay all --save-to outputs/finetune_tradeoff_all      # every method on the overlay, in another folder
+```
+
+`--methods` chooses the mitigation methods that are compared (default: all); no mitigation and the original model are
+always drawn as references. Every figure and `tradeoff_summary.csv` then contains only those rows, and the overlay
+spider plot shows all of them unless `--overlay` says otherwise. The maxima of the spider plots are taken over the rows
+shown, so they can change with `--methods`.
+
+**The seven axes, all scaled so that higher is better:**
+
+| axis | samples | scaled as | 0 | 1 |
+|---|---|---|---|---|
+| Content (GSSCD), Motion (OFS-3), Motion, filtered (OFS-3 NMF) | memorized | (no mitigation − method) / (no mitigation − original model) | copies as much as without mitigation | copies as little as the original model |
+| Caption match (ViCLIP) | memorized, background | method / no mitigation | — | no quality lost |
+| Realism (FVD) | memorized, background | no mitigation / method (FVD is lower-is-better) | — | no quality lost |
+
+The memorization axes are measured against the original model, not against 0, because raw OFS-3 has a high floor: even
+the original model, which never saw the duplicates, has 48% of the memorized samples above 0.5. The background axes
+show the side effects. Two combined scores sum it up: **memorization removed** (mean of the three memorization axes)
+and **quality kept** (mean of the four quality axes). A memorization axis above 1 means less copying than the original
+model, which usually means the video lost its content (SAIL's mean GSSCD is 0.07, the original model's 0.14). The
+original model is the memorization reference only: its FVD is worse than no mitigation's, since it was never trained on
+WebVid, so for quality the real training clips are the reference.
+
+**Two measures of memorization.** Every figure is drawn twice:
+- `*_threshold`: the percentage of the 200 memorized samples above the paper's threshold (GSSCD ≥ 0.4, OFS > 0.5; a
+  video with no filtered window counts as not above), e.g. no mitigation 61.5% for GSSCD;
+- `*_mean`: the mean score of the 200 memorized samples (the filtered OFS over the videos that have a window), e.g. no
+  mitigation 0.516 for GSSCD.
+
+The quality axes are the same in both. Every value is computed once on all the videos; there are no error bars.
+
+**The spider plots do not use the scaled axes above.** They show five metrics of the memorized samples with their own
+meaning and direction: mean ViCLIP (higher is better), GSSCD, OFS-3 and OFS-3 NMF (mean score, or the fraction above
+the threshold; lower = less copying) and FVD divided by the largest FVD of all the rows (lower is better). Each is drawn
+in two versions: `_raw`, the values as they are (only FVD divided by its maximum, so that it fits the 0–1 range of the
+others), and `_max`, every axis divided by its maximum over all the rows (the methods, no mitigation and the original
+model), so that small ranges such as ViCLIP's become visible. Every axis that is divided by its maximum says in its label what that maximum is and whose it
+is (e.g. `max 1205 (Original model)` for FVD).
+
+It writes, in `outputs/finetune_tradeoff/` (`--save-to`), as PNG and PDF:
+
+| file | shows |
+|---|---|
+| `radar_<measure>_<raw\|max>` | one spider plot per method (blue) over no mitigation (dark gray) and the original model (dashed) |
+| `radar_overlay_<measure>_<raw\|max>` | several methods on one spider plot, with no mitigation and the original model: `--overlay` takes any number of methods (a list, `all`, or `''` for none; default `guard,noise,noise_above,sail,sail_above`). A method and its variants (`noise`, `noise_above`; any `<method>_<suffix>`) share one color, the variants dashed or dotted with hollow markers; after eight families the colors repeat with another marker shape |
+| `tradeoff_<measure>` | memorization (x: GSSCD, OFS-3, OFS-3 NMF) against the quality of the memorized samples (y: ViCLIP, FVD with its axis flipped so that up is always better), raw values, one point per method; dashed = real training clips, dotted (`_mean`) = the paper's threshold |
+| `summary_<measure>` | one point per method: memorization removed (x) against quality kept (y); the goal is (1, 1) |
+| `content_vs_motion_<measure>` | GSSCD (x) against OFS-3 and OFS-3 NMF (y), with an arrow from no mitigation to every method: does it remove content copying, motion copying, or both? |
+| `scorecard_<measure>` | every method and axis as a cell: the scaled score (color, large number, darker = better) and the raw value (small number), with the two combined scores at the right |
+| `tradeoff_summary.csv` | per measure (`threshold`, `mean`), row (methods, `normal`, `original`, `training`) and axis: the `raw` and the `scaled` value |
+
+**Limits.** The ViCLIP axis is a ratio of raw cosine similarities, whose floor for unrelated videos is not 0, so it
+understates a loss: SAIL keeps "0.37" of the caption match, which is closer to none. Radar areas depend on the order of
+the axes; read the scorecard for the numbers. Spider plots and the combined scores weigh every axis the same, which is a
+choice, not a measurement.
+
 #### Reproducibility
 
 Running `train` again from the start with the same `--seed` gives **exactly the same weights**, bit for bit (checked by comparing every
@@ -1368,6 +1433,7 @@ saves in its `--out` folder:
 | `finetune.py` | artificial memorization (section 10): chooses the samples, assigns the copies, and fine-tunes the UNet (CLIP and the VAE stay frozen) |
 | `memorization_eval.py` | measures the artificial memorization (section 10): the captions of the memorized samples and as many background samples, then GSSCD and OFS-k of the generated videos, figures of the results, the comparison with the original model, and the comparison of the mitigation methods |
 | `quality_eval.py` | video quality of the same videos (section 10, step 8): FVD against real WebVid clips and ViCLIP similarity to the caption, for no mitigation, each mitigation method and the original model |
+| `method_comparison.py` | all the methods on memorization and quality together (section 10, step 9): spider plots, trade-off plots, a summary scatter, content against motion, and a scorecard |
 | `webvid.py` | WebVid-10M: metadata, video download, I3D features, duplication ranking, the prompt sheet and GSSCD of generated videos (section 8) |
 | `main.py` | command line (`attention`, `guard`, `soften`, `clip`, `noise`, `sail`, `batch`, `compare`); `experiment()` builds the normal / guard / soften / clip / noise / sail setup that all commands share |
 | `sampler.py` | loads AnimateDiff and runs the denoising loop for one prompt or a batch of prompts: normal CFG (2 streams) or GUARD / soften with repulsion (3 streams); `embed_prompts` builds the text embeddings, including the `clip` mitigation; `adjust_noise` is the `noise` experiment, `sail` the `sail` experiment, `guidance_vjp` the memory-saving gradient both use |
